@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+
+# Config (user-specific)
+config.local.py
+
+# Data (generated)
+data/*.jsonl
+data/*.json
+
+# Cache
+.analysis_cache/
+*.egg-info/
+dist/
+build/
+.DS_Store
