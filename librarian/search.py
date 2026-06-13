@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import sys
 from pathlib import Path
 
 WORD_RE = re.compile(r"[a-z0-9]+")
@@ -17,7 +16,7 @@ def load_records(index_path: str | Path) -> list[dict]:
     if not path.exists():
         return []
     records = []
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:

@@ -1,0 +1,397 @@
+"""Tests for librarian.db — SQLite/FTS5 backend (no Ableton required).
+
+Covers: init_db, upsert_sample, FTS5 search, category filter, tags,
+analysis cache, enrichment, duplicate/similarity detection, stats, migration.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from librarian.db import (  # noqa: I001
+    enrich_result,
+    find_duplicates_by_hash,
+    find_similar_by_duration,
+    find_similar_by_pitch,
+    get_db,
+    get_sample_by_path,
+    get_stats,
+    init_db,
+    migrate_from_jsonl,
+    search_samples,
+    search_samples_enriched,
+    upsert_analysis,
+    upsert_sample,
+)
+
+# ---------------------------------------------------------------------------
+# Schema / init
+# ---------------------------------------------------------------------------
+
+def test_init_db(tmp_path: Path):
+    """init_db creates all expected tables."""
+    db_path = str(tmp_path / "init_test.db")
+    init_db(db_path)
+
+    conn = get_db(db_path)
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+
+    expected = {"samples", "tags", "analysis_cache", "roots", "scan_history"}
+    assert expected.issubset(tables)
+    # FTS5 virtual table
+    assert "samples_fts" in tables
+
+
+# ---------------------------------------------------------------------------
+# Upsert (insert + update)
+# ---------------------------------------------------------------------------
+
+def test_upsert_sample(db_conn, sample_factory):
+    """Insert a sample and retrieve it by path."""
+    sid = sample_factory(
+        db_conn,
+        name="Punchy Kick",
+        category="Kick",
+        tags=["808", "punchy"],
+    )
+    assert isinstance(sid, int)
+    assert sid > 0
+
+    result = get_sample_by_path(db_conn, "/test/punchy_kick.wav")
+    assert result is not None
+    assert result["name"] == "Punchy Kick"
+    assert result["category"] == "Kick"
+    assert "808" in result["tags"]
+    assert "punchy" in result["tags"]
+
+
+def test_upsert_sample_update(db_conn, sample_factory):
+    """Upserting the same path updates the record in place."""
+    sid1 = sample_factory(
+        db_conn,
+        name="Old Name",
+        category="Kick",
+        path="/shared/path.wav",
+    )
+    # Upsert with new values on the same path
+    sid2 = upsert_sample(db_conn, {
+        "path": "/shared/path.wav",
+        "name": "New Name",
+        "ext": "wav",
+        "size": 2048,
+        "category": "Snare",
+        "folder": "/new",
+        "root": "/new",
+        "tags": ["updated"],
+    })
+    assert sid2 == sid1  # same row id
+
+    result = get_sample_by_path(db_conn, "/shared/path.wav")
+    assert result is not None
+    assert result["name"] == "New Name"
+    assert result["category"] == "Snare"
+    assert result["tags"] == ["updated"]
+
+
+# ---------------------------------------------------------------------------
+# FTS5 search
+# ---------------------------------------------------------------------------
+
+def test_fts5_search(db_conn, sample_factory):
+    """Each sample is findable by its own name."""
+    sample_factory(db_conn, name="Deep Kick", category="Kick", path="/s/kick.wav")
+    sample_factory(db_conn, name="Sharp Snare", category="Snare", path="/s/snare.wav")
+    sample_factory(db_conn, name="Closed Hat", category="HiHat", path="/s/hat.wav")
+
+    for term, expected_cat in [("Kick", "Kick"), ("Snare", "Snare"), ("Hat", "HiHat")]:
+        results = search_samples(db_conn, term)
+        assert len(results) >= 1
+        assert any(r["category"] == expected_cat for r in results)
+
+
+def test_fts5_search_multiword(db_conn, sample_factory):
+    """Multi-word queries AND-combine via FTS5."""
+    sample_factory(
+        db_conn, name="808 Kick Deep", category="Kick",
+        path="/s/multi1.wav", tags=["punchy"],
+    )
+    sample_factory(
+        db_conn, name="Acoustic Snare", category="Snare",
+        path="/s/multi2.wav",
+    )
+
+    # "deep kick" should match the kick but not the snare
+    results = search_samples(db_conn, "deep kick")
+    assert len(results) >= 1
+    names = [r["name"] for r in results]
+    assert any("Kick" in n for n in names)
+    assert not any("Snare" in n for n in names)
+
+
+# ---------------------------------------------------------------------------
+# Category filter
+# ---------------------------------------------------------------------------
+
+def test_category_filter(db_conn, sample_factory):
+    """search_samples with category filters correctly."""
+    sample_factory(db_conn, name="Boom Kick", category="Kick", path="/c/kick.wav")
+    sample_factory(db_conn, name="Boom Snare", category="Snare", path="/c/snare.wav")
+
+    # "Boom" matches both, but filtering by category=Kick limits to 1
+    kick_only = search_samples(db_conn, "Boom", category="Kick")
+    assert len(kick_only) == 1
+    assert kick_only[0]["category"] == "Kick"
+
+
+# ---------------------------------------------------------------------------
+# Tags
+# ---------------------------------------------------------------------------
+
+def test_tags_insert_and_retrieve(db_conn, sample_factory):
+    """Tags inserted via upsert_sample are retrievable and ordered."""
+    sample_factory(
+        db_conn,
+        name="Tagged Sample",
+        category="Kick",
+        path="/t/tagged.wav",
+        tags=["alpha", "beta", "gamma"],
+    )
+
+    result = get_sample_by_path(db_conn, "/t/tagged.wav")
+    assert result is not None
+    assert set(result["tags"]) == {"alpha", "beta", "gamma"}
+
+    # Tags are searchable via FTS
+    results = search_samples(db_conn, "gamma")
+    assert len(results) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Analysis cache
+# ---------------------------------------------------------------------------
+
+def test_upsert_analysis(db_conn, sample_factory):
+    """upsert_analysis stores analysis data linked to a sample."""
+    sid = sample_factory(db_conn, name="Analyzed Kick", category="Kick", path="/a/kick.wav")
+
+    upsert_analysis(db_conn, sid, {
+        "bpm": 128.0,
+        "key": "Fm",
+        "pitch": "F",
+        "note_number": 41,
+        "is_atonal": False,
+        "duration": 1.2,
+        "sample_type": "oneshot",
+        "spectral_centroid": 850.5,
+    })
+
+    row = db_conn.execute(
+        "SELECT * FROM analysis_cache WHERE sample_id = ?", (sid,)
+    ).fetchone()
+    assert row is not None
+    assert row["bpm"] == 128.0
+    assert row["key"] == "Fm"
+    assert row["pitch"] == "F"
+    assert row["sample_type"] == "oneshot"
+    assert row["is_atonal"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Enriched search + enrich_result
+# ---------------------------------------------------------------------------
+
+def test_search_enriched(db_conn, sample_factory):
+    """search_samples_enriched joins analysis data into results."""
+    sid = sample_factory(
+        db_conn, name="Enriched Kick", category="Kick", path="/e/kick.wav",
+        tags=["punchy"],
+    )
+    upsert_analysis(db_conn, sid, {
+        "bpm": 140.0,
+        "key": "Am",
+        "pitch": "A",
+        "note_number": 45,
+        "is_atonal": False,
+        "duration": 1.0,
+        "sample_type": "oneshot",
+    })
+
+    results = search_samples_enriched(db_conn, "kick")
+    assert len(results) >= 1
+    enriched = next(r for r in results if r["id"] == sid)
+    assert enriched["bpm"] == 140.0
+    assert enriched["key"] == "Am"
+    assert enriched["sample_type"] == "oneshot"
+    assert enriched["recommended_use"] == "drum_foundation"
+    assert "confidence" in enriched
+
+
+def test_enrich_result():
+    """enrich_result computes confidence, recommended_use, ableton_action."""
+    sample = {"id": 1, "category": "Kick", "name": "Boom Kick"}
+    analysis = {
+        "bpm": 128.0,
+        "key": "Fm",
+        "pitch": "F",
+        "note_number": 41,
+        "is_atonal": False,
+        "duration": 1.5,
+        "sample_type": "oneshot",
+        "spectral_centroid": 900.0,
+    }
+    enriched = enrich_result(sample, analysis)
+
+    # All analysis fields propagated
+    assert enriched["bpm"] == 128.0
+    assert enriched["key"] == "Fm"
+    assert enriched["pitch"] == "F"
+    assert enriched["sample_type"] == "oneshot"
+    assert enriched["is_atonal"] is False
+
+    # Confidence: key(0.4) + bpm(0.3) + pitch(0.2) + centroid(0.1) = 1.0
+    assert enriched["confidence"] == 1.0
+
+    # Recommended use from category map
+    assert enriched["recommended_use"] == "drum_foundation"
+
+    # Ableton action for Kick should reference pad 36
+    assert "pad_index=36" in enriched["ableton_action"]
+
+    # Compatible keys should include Fm's neighbours
+    assert "Fm" in enriched["compatible_keys"]
+
+
+def test_enrich_result_no_analysis():
+    """enrich_result without analysis still returns sensible defaults."""
+    sample = {"id": 2, "category": "FX", "name": "Riser"}
+    enriched = enrich_result(sample, None)
+
+    assert enriched["confidence"] == 0.0
+    assert enriched["recommended_use"] == "transition"
+    assert enriched["compatible_keys"] == []
+    assert enriched["is_atonal"] is False
+
+
+# ---------------------------------------------------------------------------
+# Duplicate / similarity detection
+# ---------------------------------------------------------------------------
+
+def test_find_duplicates_by_hash(db_conn, sample_factory):
+    """Two samples with the same file_hash are flagged as duplicates."""
+    sample_factory(
+        db_conn, name="Kick A", category="Kick",
+        path="/d/kick_a.wav", file_hash="abc123",
+    )
+    sample_factory(
+        db_conn, name="Kick B", category="Kick",
+        path="/d/kick_b.wav", file_hash="abc123",
+    )
+    # Unique sample that should not appear
+    sample_factory(
+        db_conn, name="Unique", category="Snare",
+        path="/d/unique.wav", file_hash="xyz789",
+    )
+
+    groups = find_duplicates_by_hash(db_conn)
+    assert len(groups) == 1
+    assert groups[0]["hash"] == "abc123"
+    assert groups[0]["count"] == 2
+
+
+def test_find_similar_by_duration(db_conn, sample_factory):
+    """Samples with near-identical durations in the same category group together."""
+    sid1 = sample_factory(
+        db_conn, name="Kick 1", category="Kick", path="/du/k1.wav",
+    )
+    sid2 = sample_factory(
+        db_conn, name="Kick 2", category="Kick", path="/du/k2.wav",
+    )
+    sid3 = sample_factory(
+        db_conn, name="Snare 1", category="Snare", path="/du/s1.wav",
+    )
+
+    # Two kicks at almost the same duration, snare far apart
+    for sid, dur in [(sid1, 1.00), (sid2, 1.02), (sid3, 3.00)]:
+        upsert_analysis(db_conn, sid, {"duration": dur, "sample_type": "oneshot"})
+
+    groups = find_similar_by_duration(db_conn, tolerance=0.1)
+    # At least one group with ≥2 kicks
+    kick_groups = [g for g in groups if g.get("category") == "Kick"]
+    assert len(kick_groups) >= 1
+    assert kick_groups[0]["count"] >= 2
+
+
+def test_find_similar_by_pitch(db_conn, sample_factory):
+    """Samples with same note_number + category group together."""
+    sid1 = sample_factory(db_conn, name="Kick A", category="Kick", path="/p/ka.wav")
+    sid2 = sample_factory(db_conn, name="Kick B", category="Kick", path="/p/kb.wav")
+    sid3 = sample_factory(db_conn, name="Kick C", category="Kick", path="/p/kc.wav")
+
+    # Two kicks at same pitch, one different
+    upsert_analysis(db_conn, sid1, {"note_number": 41, "pitch": "F", "is_atonal": False, "sample_type": "oneshot"})
+    upsert_analysis(db_conn, sid2, {"note_number": 41, "pitch": "F", "is_atonal": False, "sample_type": "oneshot"})
+    upsert_analysis(db_conn, sid3, {"note_number": 48, "pitch": "C", "is_atonal": False, "sample_type": "oneshot"})
+
+    groups = find_similar_by_pitch(db_conn, same_category=True)
+    # The two 41-pitch kicks should form a group
+    match = [g for g in groups if g.get("note_number") == 41]
+    assert len(match) == 1
+    assert match[0]["count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+
+def test_get_stats(db_conn, sample_factory):
+    """get_stats returns correct counts and category breakdown."""
+    sample_factory(db_conn, name="K1", category="Kick", ext="wav", path="/st/k1.wav")
+    sample_factory(db_conn, name="K2", category="Kick", ext="wav", path="/st/k2.wav")
+    sample_factory(db_conn, name="S1", category="Snare", ext="aiff", path="/st/s1.wav")
+
+    stats = get_stats(db_conn)
+    assert stats["total_samples"] == 3
+    assert stats["by_category"]["Kick"] == 2
+    assert stats["by_category"]["Snare"] == 1
+    assert stats["by_ext"]["wav"] == 2
+    assert stats["by_ext"]["aiff"] == 1
+    assert stats["analyzed_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Migration
+# ---------------------------------------------------------------------------
+
+def test_migrate_from_jsonl(db_conn, tmp_path: Path):
+    """migrate_from_jsonl loads records from a JSONL file."""
+    records = [
+        {"path": "/m/kick.wav", "name": "Migrated Kick", "category": "Kick", "ext": "wav"},
+        {"path": "/m/snare.wav", "name": "Migrated Snare", "category": "Snare", "ext": "wav"},
+    ]
+    jsonl_path = tmp_path / "migrate.jsonl"
+    jsonl_path.write_text(
+        "\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8"
+    )
+
+    count = migrate_from_jsonl(db_conn, str(jsonl_path))
+    assert count == 2
+
+    result = get_sample_by_path(db_conn, "/m/kick.wav")
+    assert result is not None
+    assert result["name"] == "Migrated Kick"
+    assert result["category"] == "Kick"
+
+
+def test_migrate_from_jsonl_missing_file(db_conn, tmp_path: Path):
+    """migrate_from_jsonl returns 0 for a non-existent file."""
+    count = migrate_from_jsonl(db_conn, str(tmp_path / "nonexistent.jsonl"))
+    assert count == 0

@@ -8,17 +8,16 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Optional
 
-from .analyze import get_compatible_keys, analyze_file, HAS_LIBROSA
-from .search import load_records, token_text, score
+from .analyze import HAS_LIBROSA, analyze_file, get_compatible_keys
+from .search import load_records, score, token_text
 
 
 def recommend_samples(
     index_path: str | Path,
     target_key: str,
-    terms: Optional[list[str]] = None,
-    category: Optional[str] = None,
+    terms: list[str] | None = None,
+    category: str | None = None,
     limit: int = 20,
     analyze: bool = False,
 ) -> list[dict]:

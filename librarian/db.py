@@ -24,14 +24,14 @@ Usage::
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -245,7 +245,7 @@ END;
 
 def _now_iso() -> str:
     """Return current UTC timestamp in ISO-8601 (Z suffix)."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _ensure_parent_dir(db_path: str) -> None:
@@ -686,7 +686,7 @@ def migrate_from_jsonl(conn: sqlite3.Connection, jsonl_path: str) -> int:
         return 0
 
     count = 0
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -1095,10 +1095,8 @@ def find_all_duplicates(
 
 def close_db(conn: sqlite3.Connection) -> None:
     """Commit any pending transaction and close the connection safely."""
-    try:
+    with contextlib.suppress(sqlite3.Error):
         conn.commit()
-    except sqlite3.Error:
-        pass
     conn.close()
 
 

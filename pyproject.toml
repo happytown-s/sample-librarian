@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sample-librarian"
+version = "1.0.0"
+description = "Search, analyze, and recommend audio samples from your local library."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "Sample Librarian Contributors"},
+]
+keywords = ["audio", "samples", "ableton", "music-production", "mcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+dependencies = []
+
+[project.optional-dependencies]
+analysis = [
+    "librosa>=0.10",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/mtsh/sample-librarian"
+Repository = "https://github.com/mtsh/sample-librarian"
+
+[tool.setuptools.packages.find]
+include = ["librarian*"]
+
+# ---------------------------------------------------------------------------
+# Ruff
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+# E/W — pycodestyle, F — pyflakes, I — isort, UP — pyupgrade,
+# B — flake8-bugbear, SIM — flake8-simplify
+select = ["E", "W", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # function call in default argument (pytest fixtures pattern)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests can use longer lines, star imports, and assert statements
+"tests/*" = ["E402", "S101"]
+"librarian/*" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["librarian"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"

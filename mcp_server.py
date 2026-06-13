@@ -33,10 +33,10 @@ try:
 except ImportError:
     HAS_MCP = False
 
-from librarian.index import build_index, IndexConfig
-from librarian.search import search_index, load_records
 from librarian.analyze import analyze_file, analyze_folder, get_compatible_keys
+from librarian.index import IndexConfig, build_index
 from librarian.recommend import recommend_samples
+from librarian.search import search_index
 
 # Check LiveAgent availability lazily
 _LIVEAGENT_CHECKED = False
@@ -245,7 +245,7 @@ def librarian_list_roots() -> str:
 
     if index_exists:
         # Count lines in JSONL
-        with open(index_path, "r", encoding="utf-8") as f:
+        with open(index_path, encoding="utf-8") as f:
             index_size = sum(1 for _ in f)
         mtime = os.path.getmtime(index_path)
         index_mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))

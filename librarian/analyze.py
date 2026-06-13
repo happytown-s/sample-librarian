@@ -53,8 +53,8 @@ def get_compatible_keys(key: str) -> list[str]:
     compatible = []
 
     # Same number (relative major/minor)
-    for l in ("A", "B"):
-        code = f"{num}{l}"
+    for side in ("A", "B"):
+        code = f"{num}{side}"
         if code in CAMELOT_TO_KEY:
             compatible.append(CAMELOT_TO_KEY[code])
 

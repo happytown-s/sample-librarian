@@ -11,16 +11,14 @@ Scans folders for audio files (wav, aiff, mp3, ogg, flac) and records:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
 import sys
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
-
 
 DEFAULT_ROOTS = [
     "~/Music/Ableton/User Library/Samples",

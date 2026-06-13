@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import socket
-from typing import Any, Optional
+from typing import Any
 
 try:
     from .config import get_liveagent_host, get_liveagent_port
@@ -47,7 +47,7 @@ class LiveAgentNotAvailable(RuntimeError):
 
 def _send(
     command: str,
-    payload: Optional[dict[str, Any]] = None,
+    payload: dict[str, Any] | None = None,
     host: str = "",
     port: int = 0,
     timeout: int = 10,
@@ -72,8 +72,8 @@ def _send(
             if b"\n" in data:
                 break
         return json.loads(data.decode().strip())
-    except (ConnectionRefusedError, socket.timeout, OSError) as e:
-        raise LiveAgentNotAvailable(str(e))
+    except (TimeoutError, ConnectionRefusedError, OSError) as e:
+        raise LiveAgentNotAvailable(str(e)) from e
     finally:
         sock.close()
 
@@ -290,8 +290,8 @@ def build_drum_rack_for_key(
         Summary: target_key, compatible_keys, track_index, loaded_samples,
         pattern, clip_info.
     """
-    from .db import get_db, search_samples_enriched, close_db, DEFAULT_DB_PATH
     from .analyze import get_compatible_keys
+    from .db import DEFAULT_DB_PATH, close_db, get_db, search_samples_enriched
 
     host = host or _DEFAULT_HOST
     port = port or _DEFAULT_PORT
@@ -337,7 +337,7 @@ def build_drum_rack_for_key(
 
     # ── Step 2: Create / locate Drum Rack track ──
     if track_index < 0:
-        rack_result = _send(
+        _send(
             "create_drum_rack",
             {"track_index": -1, "name": f"Drum Rack ({target_key})", "kit_name": kit_name},
             host, port,
