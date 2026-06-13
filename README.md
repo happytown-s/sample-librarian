@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="assets/banner_en.jpg" alt="Sample Librarian" width="640">
+  <a href="https://happytown-s.github.io/sample-librarian/"><img src="assets/banner_en.jpg" alt="Sample Librarian" width="640"></a>
+</p>
+
+<p align="center">
+  <a href="https://happytown-s.github.io/sample-librarian/"><b>🌐 Landing Page</b></a> · <a href="https://happytown-s.github.io/live-agent-remote/"><b>🎹 live-agent-remote</b></a>
 </p>
 
 <p align="center">
