@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.jpg" alt="Sample Librarian" width="640">
+  <img src="assets/banner_en.jpg" alt="Sample Librarian" width="640">
 </p>
 
 <p align="center">
