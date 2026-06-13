@@ -869,6 +869,227 @@ def search_samples_enriched(
 
 
 # ---------------------------------------------------------------------------
+# Public API — duplicate / similarity detection
+# ---------------------------------------------------------------------------
+
+
+def find_duplicates_by_hash(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Find exact duplicates by file_hash.
+
+    Returns groups of samples sharing the same file_hash (content-identical).
+    Each group dict has: hash, count, samples (list of sample dicts).
+    """
+    rows = conn.execute(
+        """
+        SELECT file_hash, COUNT(*) as cnt
+        FROM samples
+        WHERE file_hash IS NOT NULL AND file_hash != ''
+        GROUP BY file_hash
+        HAVING cnt > 1
+        ORDER BY cnt DESC
+        """
+    ).fetchall()
+
+    groups: list[dict[str, Any]] = []
+    for row in rows:
+        h = row[0]
+        sample_rows = conn.execute(
+            "SELECT * FROM samples WHERE file_hash = ? ORDER BY path", (h,)
+        ).fetchall()
+        samples = [dict(r) for r in sample_rows]
+        for s in samples:
+            s["tags"] = get_sample_tags(conn, s["id"])
+        groups.append({"hash": h, "count": len(samples), "samples": samples})
+
+    return groups
+
+
+def find_similar_by_duration(
+    conn: sqlite3.Connection,
+    tolerance: float = 0.05,
+) -> list[dict[str, Any]]:
+    """Find samples with near-identical durations (potential duplicates).
+
+    Groups samples whose durations are within ``tolerance`` seconds of each
+    other AND share the same category.  Uses analysis_cache for duration data.
+    """
+    rows = conn.execute(
+        """
+        SELECT s.id, s.path, s.name, s.category, s.size, a.duration
+        FROM samples s
+        JOIN analysis_cache a ON a.sample_id = s.id
+        WHERE a.duration IS NOT NULL AND a.duration > 0
+        ORDER BY s.category, a.duration
+        """
+    ).fetchall()
+
+    # Group by category + similar duration
+    groups: list[dict[str, Any]] = []
+    current_group: list[dict] = []
+    current_cat: str | None = None
+    current_dur: float | None = None
+
+    for row in rows:
+        d = dict(row)
+        cat = d.get("category", "")
+        dur = d.get("duration", 0)
+
+        if cat != current_cat or current_dur is None or abs(dur - current_dur) > tolerance:
+            if len(current_group) > 1:
+                groups.append({
+                    "category": current_cat,
+                    "duration_range": [current_group[0]["duration"], current_group[-1]["duration"]],
+                    "count": len(current_group),
+                    "samples": current_group,
+                })
+            current_group = [d]
+            current_cat = cat
+            current_dur = dur
+        else:
+            current_group.append(d)
+            current_dur = dur
+
+    # Flush last group
+    if len(current_group) > 1:
+        groups.append({
+            "category": current_cat,
+            "duration_range": [current_group[0]["duration"], current_group[-1]["duration"]],
+            "count": len(current_group),
+            "samples": current_group,
+        })
+
+    return groups
+
+
+def find_similar_by_pitch(
+    conn: sqlite3.Connection,
+    same_category: bool = True,
+) -> list[dict[str, Any]]:
+    """Find samples with the same pitch and sample_type.
+
+    Groups non-atonal samples by (note_number, sample_type).  Useful for
+    finding multiple kicks at the same pitch, snares at the same pitch, etc.
+    """
+    sql = """
+        SELECT s.id, s.path, s.name, s.category, s.size,
+               a.note_number, a.pitch, a.sample_type, a.is_atonal
+        FROM samples s
+        JOIN analysis_cache a ON a.sample_id = s.id
+        WHERE a.note_number IS NOT NULL AND a.is_atonal = 0
+    """
+    if same_category:
+        sql += " ORDER BY s.category, a.note_number"
+    else:
+        sql += " ORDER BY a.note_number, s.category"
+
+    rows = conn.execute(sql).fetchall()
+
+    # Group by (note_number, sample_type)
+    from collections import defaultdict
+    key_map: dict[tuple, list[dict]] = defaultdict(list)
+
+    for row in rows:
+        d = dict(row)
+        key = (d["note_number"], d.get("sample_type", ""))
+        if same_category:
+            key = (d.get("category", ""),) + key
+        key_map[key].append(d)
+
+    groups: list[dict[str, Any]] = []
+    for key, samples in key_map.items():
+        if len(samples) > 1:
+            group: dict[str, Any] = {
+                "count": len(samples),
+                "samples": samples,
+            }
+            if same_category:
+                group["category"] = key[0]
+                group["note_number"] = key[1]
+                group["pitch"] = samples[0].get("pitch")
+                group["sample_type"] = key[2]
+            else:
+                group["note_number"] = key[0]
+                group["pitch"] = samples[0].get("pitch")
+                group["sample_type"] = key[1]
+            groups.append(group)
+
+    groups.sort(key=lambda g: g["count"], reverse=True)
+    return groups
+
+
+def find_similar_by_spectral(
+    conn: sqlite3.Connection,
+    tolerance: float = 50.0,
+) -> list[dict[str, Any]]:
+    """Find samples with similar spectral centroid (similar timbre).
+
+    Groups samples whose spectral centroids are within ``tolerance`` Hz of
+    each other AND share the same category.  Requires analysis_cache to have
+    spectral_centroid populated.
+    """
+    rows = conn.execute(
+        """
+        SELECT s.id, s.path, s.name, s.category, s.size,
+               a.spectral_centroid, a.sample_type
+        FROM samples s
+        JOIN analysis_cache a ON a.sample_id = s.id
+        WHERE a.spectral_centroid IS NOT NULL
+        ORDER BY s.category, a.spectral_centroid
+        """
+    ).fetchall()
+
+    groups: list[dict[str, Any]] = []
+    current_group: list[dict] = []
+    current_cat: str | None = None
+    current_centroid: float | None = None
+
+    for row in rows:
+        d = dict(row)
+        cat = d.get("category", "")
+        centroid = d.get("spectral_centroid", 0)
+
+        if cat != current_cat or current_centroid is None or abs(centroid - current_centroid) > tolerance:
+            if len(current_group) > 1:
+                groups.append({
+                    "category": current_cat,
+                    "centroid_range": [current_group[0]["spectral_centroid"], current_group[-1]["spectral_centroid"]],
+                    "count": len(current_group),
+                    "samples": current_group,
+                })
+            current_group = [d]
+            current_cat = cat
+            current_centroid = centroid
+        else:
+            current_group.append(d)
+            current_centroid = centroid
+
+    if len(current_group) > 1:
+        groups.append({
+            "category": current_cat,
+            "centroid_range": [current_group[0]["spectral_centroid"], current_group[-1]["spectral_centroid"]],
+            "count": len(current_group),
+            "samples": current_group,
+        })
+
+    return groups
+
+
+def find_all_duplicates(
+    conn: sqlite3.Connection,
+) -> dict[str, list[dict[str, Any]]]:
+    """Run all duplicate/similarity checks and return a combined report.
+
+    Returns dict with keys: by_hash, by_duration, by_pitch, by_spectral.
+    """
+    return {
+        "by_hash": find_duplicates_by_hash(conn),
+        "by_duration": find_similar_by_duration(conn),
+        "by_pitch": find_similar_by_pitch(conn),
+        "by_spectral": find_similar_by_spectral(conn),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public API — teardown
 # ---------------------------------------------------------------------------
 
