@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.jpg" alt="Sample Librarian" width="640">
+</p>
+
 # Sample Librarian
 
 Search, analyze, and recommend audio samples from your local library.
