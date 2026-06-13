@@ -704,6 +704,171 @@ def migrate_from_jsonl(conn: sqlite3.Connection, jsonl_path: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Public API — AI-friendly enrichment
+# ---------------------------------------------------------------------------
+
+# Category → recommended use mapping
+_CATEGORY_USE_MAP = {
+    "Kick": "drum_foundation",
+    "Snare": "drum_foundation",
+    "HiHat": "drum_foundation",
+    "Clap": "drum_foundation",
+    "Cymbal": "drum_foundation",
+    "Tom": "drum_foundation",
+    "Percussion": "drum_foundation",
+    "Shaker": "groove_layer",
+    "Bass": "bassline",
+    "Sub": "sub_layer",
+    "Lead": "melody",
+    "Synth": "melody",
+    "Pad": "harmony",
+    "Pads": "harmony",
+    "FX": "transition",
+    "Vocal": "vocal_chop",
+    "Loop": "full_loop",
+    "OneShot": "single_hit",
+}
+
+# Category → Ableton action suggestion
+_CATEGORY_ACTION_MAP = {
+    "Kick": "load_sample_to_pad(track_index, pad_index=36, file_path)",
+    "Snare": "load_sample_to_pad(track_index, pad_index=38, file_path)",
+    "HiHat": "load_sample_to_pad(track_index, pad_index=42, file_path)",
+    "Clap": "load_sample_to_pad(track_index, pad_index=39, file_path)",
+    "Cymbal": "load_sample_to_pad(track_index, pad_index=49, file_path)",
+    "Tom": "load_sample_to_pad(track_index, pad_index=45, file_path)",
+    "Percussion": "load_sample_to_pad(track_index, pad_index=40, file_path)",
+    "Shaker": "load_sample_to_pad(track_index, pad_index=44, file_path)",
+    "Bass": "import_audio_clip(track_index, slot_index, file_path)",
+    "Sub": "import_audio_clip(track_index, slot_index, file_path)",
+    "Lead": "import_audio_clip(track_index, slot_index, file_path)",
+    "Synth": "import_audio_clip(track_index, slot_index, file_path)",
+    "Pad": "import_audio_clip(track_index, slot_index, file_path)",
+    "Pads": "import_audio_clip(track_index, slot_index, file_path)",
+    "FX": "import_audio_clip(track_index, slot_index, file_path)",
+    "Vocal": "import_audio_clip(track_index, slot_index, file_path)",
+    "Loop": "import_audio_clip(track_index, slot_index, file_path)",
+    "OneShot": "load_sample_to_pad(track_index, pad_index=36, file_path)",
+}
+
+
+def enrich_result(sample: dict[str, Any], analysis: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Enrich a raw sample dict with AI-friendly fields.
+
+    Adds:
+    - ``key`` — detected musical key (from analysis_cache)
+    - ``bpm`` — detected tempo
+    - ``sample_type`` — oneshot / short_loop / medium_loop / long_loop
+    - ``pitch`` — detected pitch note name
+    - ``is_atonal`` — bool (true for non-pitched samples like hi-hats)
+    - ``confidence`` — heuristic confidence score (0.0–1.0)
+    - ``recommended_use`` — how to use this sample in a track
+    - ``ableton_action`` — suggested LiveAgent tool call
+    - ``compatible_keys`` — list of harmonically compatible keys (if key known)
+
+    Parameters
+    ----------
+    sample:
+        Raw sample dict from search_samples or get_sample_by_path.
+    analysis:
+        Optional analysis_cache row dict.  If None, looks up from DB.
+    """
+    category = sample.get("category", "Other")
+
+    # Merge analysis fields if available
+    a = analysis or {}
+    key_val = a.get("key") or a.get("estimated_key_root")
+    bpm_val = a.get("bpm")
+    pitch_val = a.get("pitch") or a.get("note_name")
+    note_number = a.get("note_number")
+    is_atonal = bool(a.get("is_atonal", False))
+    duration = a.get("duration")
+    sample_type = a.get("sample_type")
+    spectral_centroid = a.get("spectral_centroid")
+
+    # Confidence heuristic
+    confidence = 0.0
+    if key_val:
+        confidence += 0.4
+    if bpm_val:
+        confidence += 0.3
+    if pitch_val and not is_atonal:
+        confidence += 0.2
+    if spectral_centroid is not None:
+        confidence += 0.1
+    confidence = round(min(confidence, 1.0), 2)
+
+    # Recommended use
+    recommended_use = _CATEGORY_USE_MAP.get(category, "general")
+
+    # Ableton action suggestion
+    ableton_action = _CATEGORY_ACTION_MAP.get(category, "import_audio_clip(track_index, slot_index, file_path)")
+
+    # Compatible keys (Camelot Wheel)
+    compatible_keys: list[str] = []
+    if key_val:
+        try:
+            from .analyze import get_compatible_keys
+            compatible_keys = get_compatible_keys(key_val)
+        except Exception:
+            pass
+
+    enriched = {
+        **sample,
+        "key": key_val,
+        "bpm": bpm_val,
+        "pitch": pitch_val,
+        "note_number": note_number,
+        "is_atonal": is_atonal,
+        "duration": duration,
+        "sample_type": sample_type,
+        "confidence": confidence,
+        "recommended_use": recommended_use,
+        "ableton_action": ableton_action,
+        "compatible_keys": compatible_keys,
+    }
+    return enriched
+
+
+def search_samples_enriched(
+    conn: sqlite3.Connection,
+    query: str,
+    category: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Search and return AI-friendly enriched results.
+
+    Combines FTS5 search with analysis_cache JOIN to produce results that
+    include key, BPM, sample_type, confidence, recommended_use, and
+    ableton_action — optimised for agent decision-making.
+    """
+    results = search_samples(conn, query, category=category, limit=limit)
+    if not results:
+        return []
+
+    # Batch-fetch analysis for all result IDs
+    sample_ids = [r["id"] for r in results if "id" in r]
+    analysis_map: dict[int, dict] = {}
+    if sample_ids:
+        placeholders = ",".join("?" * len(sample_ids))
+        rows = conn.execute(
+            f"SELECT * FROM analysis_cache WHERE sample_id IN ({placeholders})",
+            sample_ids,
+        ).fetchall()
+        for row in rows:
+            d = dict(row)
+            analysis_map[d["sample_id"]] = d
+
+    enriched: list[dict[str, Any]] = []
+    for r in results:
+        sid = r.get("id")
+        analysis = analysis_map.get(sid) if sid else None
+        enriched.append(enrich_result(r, analysis))
+
+    return enriched
+
+
+# ---------------------------------------------------------------------------
 # Public API — teardown
 # ---------------------------------------------------------------------------
 
