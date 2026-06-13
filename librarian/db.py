@@ -1,0 +1,782 @@
+"""SQLite + FTS5 database backend for the Sample Librarian.
+
+Replaces the JSONL-based index/search with a proper relational store and
+full-text search via SQLite FTS5.  All search hits are ranked with BM25.
+
+Schema overview
+---------------
+samples          – one row per indexed audio file (UNIQUE on path)
+tags             – many-to-many tags per sample (sample_id FK)
+analysis_cache   – 1:1 audio-analysis results per sample (sample_id UNIQUE FK)
+roots            – scanned root folders with last-scanned timestamp
+scan_history     – audit log of scan runs
+samples_fts      – FTS5 external-content table mirroring samples + tags
+
+Usage::
+
+    from librarian.db import get_db, search_samples, init_db
+
+    init_db("data/samples.db")
+    conn = get_db("data/samples.db")
+    hits = search_samples(conn, "808 kick punchy", category="Kick")
+    conn.close()
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+DEFAULT_DB_PATH = "data/samples.db"
+
+_SCHEMA_VERSION = 1
+
+
+# ---------------------------------------------------------------------------
+# Schema DDL
+# ---------------------------------------------------------------------------
+
+_CREATE_SAMPLES = """
+CREATE TABLE IF NOT EXISTS samples (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    path          TEXT NOT NULL UNIQUE,
+    name          TEXT NOT NULL DEFAULT '',
+    ext           TEXT NOT NULL DEFAULT '',
+    size          INTEGER NOT NULL DEFAULT 0,
+    category      TEXT NOT NULL DEFAULT '',
+    folder        TEXT NOT NULL DEFAULT '',
+    root          TEXT NOT NULL DEFAULT '',
+    file_hash     TEXT,
+    strings_json  TEXT NOT NULL DEFAULT '[]',
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+"""
+
+_CREATE_TAGS = """
+CREATE TABLE IF NOT EXISTS tags (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id   INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
+    tag         TEXT NOT NULL,
+    UNIQUE(sample_id, tag)
+);
+"""
+
+_CREATE_TAGS_IDX_1 = """
+CREATE INDEX IF NOT EXISTS idx_tags_sample_id ON tags(sample_id);
+"""
+
+_CREATE_TAGS_IDX_2 = """
+CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
+"""
+
+_CREATE_ANALYSIS_CACHE = """
+CREATE TABLE IF NOT EXISTS analysis_cache (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id         INTEGER NOT NULL UNIQUE REFERENCES samples(id) ON DELETE CASCADE,
+    bpm               REAL,
+    key               TEXT,
+    pitch             TEXT,
+    note_number       INTEGER,
+    is_atonal         INTEGER NOT NULL DEFAULT 0,
+    duration          REAL,
+    sample_type       TEXT,
+    spectral_centroid REAL,
+    analysis_json     TEXT,
+    analyzed_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+"""
+
+_CREATE_ROOTS = """
+CREATE TABLE IF NOT EXISTS roots (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    path         TEXT NOT NULL UNIQUE,
+    last_scanned TEXT,
+    file_count   INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+_CREATE_SCAN_HISTORY = """
+CREATE TABLE IF NOT EXISTS scan_history (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    root_path     TEXT NOT NULL,
+    started_at    TEXT NOT NULL,
+    completed_at  TEXT,
+    files_found   INTEGER NOT NULL DEFAULT 0,
+    files_new     INTEGER NOT NULL DEFAULT 0,
+    files_updated INTEGER NOT NULL DEFAULT 0,
+    status        TEXT NOT NULL DEFAULT 'running'
+);
+"""
+
+# FTS5 external-content virtual table.
+# Mirrors searchable text columns from *samples* plus a synthesised *tags_text*
+# column that is maintained by helper / triggers.
+_CREATE_SAMPLES_FTS = """
+CREATE VIRTUAL TABLE IF NOT EXISTS samples_fts USING fts5(
+    name,
+    category,
+    folder,
+    tags_text,
+    content='samples',
+    content_rowid='id',
+    tokenize='unicode61'
+);
+"""
+
+# ---------------------------------------------------------------------------
+# FTS5 sync triggers on *samples*
+#
+# With the external-content pattern FTS5 must be kept in step manually.
+# These three triggers handle INSERT / DELETE / UPDATE on the samples table.
+# Note: *tags_text* is always NULL on the samples row (the column lives only in
+# the FTS index), so the trigger uses a sub-select to assemble tag text.
+# ---------------------------------------------------------------------------
+
+_TRIGGER_SAMPLES_AI = """
+CREATE TRIGGER IF NOT EXISTS samples_ai AFTER INSERT ON samples BEGIN
+    INSERT INTO samples_fts(rowid, name, category, folder, tags_text)
+    VALUES (
+        new.id,
+        COALESCE(new.name, ''),
+        COALESCE(new.category, ''),
+        COALESCE(new.folder, ''),
+        (SELECT COALESCE(group_concat(tag, ' '), '') FROM tags WHERE sample_id = new.id)
+    );
+END;
+"""
+
+_TRIGGER_SAMPLES_AD = """
+CREATE TRIGGER IF NOT EXISTS samples_ad AFTER DELETE ON samples BEGIN
+    INSERT INTO samples_fts(samples_fts, rowid, name, category, folder, tags_text)
+    VALUES ('delete', old.id, old.name, old.category, old.folder, '');
+END;
+"""
+
+_TRIGGER_SAMPLES_AU = """
+CREATE TRIGGER IF NOT EXISTS samples_au AFTER UPDATE ON samples BEGIN
+    INSERT INTO samples_fts(samples_fts, rowid, name, category, folder, tags_text)
+    VALUES ('delete', old.id, old.name, old.category, old.folder, '');
+    INSERT INTO samples_fts(rowid, name, category, folder, tags_text)
+    VALUES (
+        new.id,
+        COALESCE(new.name, ''),
+        COALESCE(new.category, ''),
+        COALESCE(new.folder, ''),
+        (SELECT COALESCE(group_concat(tag, ' '), '') FROM tags WHERE sample_id = new.id)
+    );
+END;
+"""
+
+# ---------------------------------------------------------------------------
+# FTS5 sync triggers on *tags*
+#
+# When tags are added, removed, or changed the tags_text column for the
+# affected sample must be rebuilt in the FTS5 index.  Because FTS5 external-
+# content tables do not support column-level UPDATE, we use the standard
+# 'delete' + re-INSERT pattern to replace the entire indexed row.
+# ---------------------------------------------------------------------------
+
+_TRIGGER_TAGS_AI = """
+CREATE TRIGGER IF NOT EXISTS tags_ai AFTER INSERT ON tags BEGIN
+    INSERT INTO samples_fts(samples_fts, rowid, name, category, folder, tags_text)
+    VALUES ('delete', new.sample_id,
+        COALESCE((SELECT name FROM samples WHERE id = new.sample_id), ''),
+        COALESCE((SELECT category FROM samples WHERE id = new.sample_id), ''),
+        COALESCE((SELECT folder FROM samples WHERE id = new.sample_id), ''),
+        '');
+    INSERT INTO samples_fts(rowid, name, category, folder, tags_text)
+    VALUES (new.sample_id,
+        COALESCE((SELECT name FROM samples WHERE id = new.sample_id), ''),
+        COALESCE((SELECT category FROM samples WHERE id = new.sample_id), ''),
+        COALESCE((SELECT folder FROM samples WHERE id = new.sample_id), ''),
+        COALESCE((SELECT group_concat(tag, ' ') FROM tags WHERE sample_id = new.sample_id), ''));
+END;
+"""
+
+_TRIGGER_TAGS_AD = """
+CREATE TRIGGER IF NOT EXISTS tags_ad AFTER DELETE ON tags BEGIN
+    INSERT INTO samples_fts(samples_fts, rowid, name, category, folder, tags_text)
+    VALUES ('delete', old.sample_id,
+        COALESCE((SELECT name FROM samples WHERE id = old.sample_id), ''),
+        COALESCE((SELECT category FROM samples WHERE id = old.sample_id), ''),
+        COALESCE((SELECT folder FROM samples WHERE id = old.sample_id), ''),
+        '');
+    INSERT INTO samples_fts(rowid, name, category, folder, tags_text)
+    VALUES (old.sample_id,
+        COALESCE((SELECT name FROM samples WHERE id = old.sample_id), ''),
+        COALESCE((SELECT category FROM samples WHERE id = old.sample_id), ''),
+        COALESCE((SELECT folder FROM samples WHERE id = old.sample_id), ''),
+        COALESCE((SELECT group_concat(tag, ' ') FROM tags WHERE sample_id = old.sample_id), ''));
+END;
+"""
+
+_TRIGGER_TAGS_AU = """
+CREATE TRIGGER IF NOT EXISTS tags_au AFTER UPDATE ON tags BEGIN
+    INSERT INTO samples_fts(samples_fts, rowid, name, category, folder, tags_text)
+    VALUES ('delete', new.sample_id,
+        COALESCE((SELECT name FROM samples WHERE id = new.sample_id), ''),
+        COALESCE((SELECT category FROM samples WHERE id = new.sample_id), ''),
+        COALESCE((SELECT folder FROM samples WHERE id = new.sample_id), ''),
+        '');
+    INSERT INTO samples_fts(rowid, name, category, folder, tags_text)
+    VALUES (new.sample_id,
+        COALESCE((SELECT name FROM samples WHERE id = new.sample_id), ''),
+        COALESCE((SELECT category FROM samples WHERE id = new.sample_id), ''),
+        COALESCE((SELECT folder FROM samples WHERE id = new.sample_id), ''),
+        COALESCE((SELECT group_concat(tag, ' ') FROM tags WHERE sample_id = new.sample_id), ''));
+END;
+"""
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _now_iso() -> str:
+    """Return current UTC timestamp in ISO-8601 (Z suffix)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _ensure_parent_dir(db_path: str) -> None:
+    """Create parent directory for *db_path* if it does not exist."""
+    parent = os.path.dirname(db_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _rebuild_tags_text(conn: sqlite3.Connection, sample_id: int) -> None:
+    """Recompute the *tags_text* column in ``samples_fts`` for a sample.
+
+    FTS5 external-content tables do not support column-level ``UPDATE``, so
+    we replace the row using the standard 'delete' + re-INSERT pattern.
+
+    Called from Python-side code paths (e.g. :func:`upsert_sample`) after
+    bulk-replacing tags, to guarantee the FTS index reflects the latest tag set.
+    """
+    # Fetch the current sample + tag data in a single round-trip.
+    row = conn.execute(
+        """
+        SELECT s.name, s.category, s.folder,
+               (SELECT COALESCE(group_concat(t.tag, ' '), '')
+                FROM tags t WHERE t.sample_id = s.id) AS tags_text
+        FROM samples s WHERE s.id = ?
+        """,
+        (sample_id,),
+    ).fetchone()
+    if row is None:
+        return
+    name = row["name"] or ""
+    category = row["category"] or ""
+    folder = row["folder"] or ""
+    tags_text = row["tags_text"] or ""
+
+    # Remove old FTS entry and re-insert with fresh tags_text.
+    conn.execute(
+        "INSERT INTO samples_fts(samples_fts, rowid, name, category, folder, tags_text) "
+        "VALUES ('delete', ?, ?, ?, ?, '')",
+        (sample_id, name, category, folder),
+    )
+    conn.execute(
+        "INSERT INTO samples_fts(rowid, name, category, folder, tags_text) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (sample_id, name, category, folder, tags_text),
+    )
+
+
+def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    """Convert a ``sqlite3.Row`` to a plain dict (or None)."""
+    if row is None:
+        return None
+    return dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Public API — connection / initialisation
+# ---------------------------------------------------------------------------
+
+def get_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
+    """Open (or create) a database connection with sensible defaults.
+
+    Parameters
+    ----------
+    db_path:
+        Path to the SQLite database file.
+
+    Returns
+    -------
+    sqlite3.Connection
+        Connection with ``row_factory`` set to :class:`sqlite3.Row`,
+        ``PRAGMA foreign_keys = ON`` and ``PRAGMA journal_mode = WAL``.
+    """
+    _ensure_parent_dir(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
+
+def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
+    """Create all tables, triggers, and indexes if they don't already exist.
+
+    Safe to call multiple times — every statement uses ``IF NOT EXISTS``.
+    """
+    conn = get_db(db_path)
+    try:
+        cur = conn.cursor()
+
+        # --- Core tables --------------------------------------------------
+        cur.execute(_CREATE_SAMPLES)
+        cur.execute(_CREATE_TAGS)
+        cur.execute(_CREATE_TAGS_IDX_1)
+        cur.execute(_CREATE_TAGS_IDX_2)
+        cur.execute(_CREATE_ANALYSIS_CACHE)
+        cur.execute(_CREATE_ROOTS)
+        cur.execute(_CREATE_SCAN_HISTORY)
+
+        # --- FTS5 virtual table ------------------------------------------
+        cur.execute(_CREATE_SAMPLES_FTS)
+
+        # --- Triggers (samples ↔ FTS5) -----------------------------------
+        cur.execute(_TRIGGER_SAMPLES_AI)
+        cur.execute(_TRIGGER_SAMPLES_AD)
+        cur.execute(_TRIGGER_SAMPLES_AU)
+
+        # --- Triggers (tags ↔ FTS5 tags_text) ----------------------------
+        cur.execute(_TRIGGER_TAGS_AI)
+        cur.execute(_TRIGGER_TAGS_AD)
+        cur.execute(_TRIGGER_TAGS_AU)
+
+        # --- Convenience indexes -----------------------------------------
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_samples_category ON samples(category);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_samples_ext ON samples(ext);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_samples_root ON samples(root);")
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Public API — sample CRUD
+# ---------------------------------------------------------------------------
+
+def upsert_sample(conn: sqlite3.Connection, record: dict[str, Any]) -> int:
+    """Insert or update a sample record and return its ``sample_id``.
+
+    Expected keys in *record* (missing values default to empty / zero):
+
+    ``path`` (required), ``name``, ``ext``, ``size``, ``category``,
+    ``folder``, ``root``, ``file_hash``, ``strings`` (list[str]),
+    ``tags`` (list[str]).
+    """
+    if not record or not record.get("path"):
+        raise ValueError("record must contain a non-empty 'path' key")
+
+    path = record["path"]
+    name = record.get("name", "") or ""
+    ext = record.get("ext", "") or ""
+    size = int(record.get("size", 0) or 0)
+    category = record.get("category", "") or ""
+    folder = record.get("folder", "") or ""
+    root = record.get("root", "") or ""
+    file_hash = record.get("file_hash")
+    strings = record.get("strings", [])
+    strings_json = json.dumps(strings, ensure_ascii=False) if strings else "[]"
+    tags = record.get("tags", []) or []
+
+    now = _now_iso()
+
+    # Try INSERT … ON CONFLICT for upsert (SQLite ≥ 3.24.0).
+    conn.execute(
+        """
+        INSERT INTO samples (path, name, ext, size, category, folder, root,
+                             file_hash, strings_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET
+            name          = excluded.name,
+            ext           = excluded.ext,
+            size          = excluded.size,
+            category      = excluded.category,
+            folder        = excluded.folder,
+            root          = excluded.root,
+            file_hash     = excluded.file_hash,
+            strings_json  = excluded.strings_json,
+            updated_at    = excluded.updated_at
+        """,
+        (path, name, ext, size, category, folder, root, file_hash,
+         strings_json, now, now),
+    )
+
+    row = conn.execute("SELECT id FROM samples WHERE path = ?", (path,)).fetchone()
+    sample_id = row[0]
+
+    # --- Sync tags ----------------------------------------------------
+    _replace_tags(conn, sample_id, tags)
+
+    # --- Rebuild FTS tags_text (belt-and-suspenders alongside trigger) -
+    _rebuild_tags_text(conn, sample_id)
+
+    conn.commit()
+    return sample_id
+
+
+def _replace_tags(conn: sqlite3.Connection, sample_id: int, tags: list[str]) -> None:
+    """Replace the full set of tags for *sample_id*."""
+    conn.execute("DELETE FROM tags WHERE sample_id = ?", (sample_id,))
+    if tags:
+        # Deduplicate while preserving order.
+        seen: set[str] = set()
+        unique_tags = []
+        for t in tags:
+            t = t.strip()
+            if t and t not in seen:
+                seen.add(t)
+                unique_tags.append(t)
+        conn.executemany(
+            "INSERT OR IGNORE INTO tags (sample_id, tag) VALUES (?, ?)",
+            [(sample_id, t) for t in unique_tags],
+        )
+
+
+def upsert_analysis(conn: sqlite3.Connection, sample_id: int, analysis: dict[str, Any]) -> None:
+    """Insert or update cached audio-analysis results for a sample.
+
+    Recognised keys (all optional): ``bpm``, ``key``, ``pitch``,
+    ``note_number``, ``is_atonal``, ``duration``, ``sample_type``,
+    ``spectral_centroid``.  Any extra keys are preserved inside
+    ``analysis_json``.
+    """
+    if not analysis:
+        analysis = {}
+
+    bpm = analysis.get("bpm")
+    key = analysis.get("key") or analysis.get("estimated_key_root")
+    pitch = analysis.get("pitch") or analysis.get("note_name")
+    note_number = analysis.get("note_number")
+    is_atonal = 1 if analysis.get("is_atonal", False) else 0
+    duration = analysis.get("duration")
+    sample_type = analysis.get("sample_type")
+    spectral_centroid = analysis.get("spectral_centroid")
+    analysis_json = json.dumps(analysis, ensure_ascii=False)
+    now = _now_iso()
+
+    conn.execute(
+        """
+        INSERT INTO analysis_cache
+            (sample_id, bpm, key, pitch, note_number, is_atonal,
+             duration, sample_type, spectral_centroid, analysis_json, analyzed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(sample_id) DO UPDATE SET
+            bpm               = excluded.bpm,
+            key               = excluded.key,
+            pitch             = excluded.pitch,
+            note_number       = excluded.note_number,
+            is_atonal         = excluded.is_atonal,
+            duration          = excluded.duration,
+            sample_type       = excluded.sample_type,
+            spectral_centroid = excluded.spectral_centroid,
+            analysis_json     = excluded.analysis_json,
+            analyzed_at       = excluded.analyzed_at
+        """,
+        (sample_id, bpm, key, pitch, note_number, is_atonal, duration,
+         sample_type, spectral_centroid, analysis_json, now),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Public API — queries
+# ---------------------------------------------------------------------------
+
+def search_samples(
+    conn: sqlite3.Connection,
+    query: str,
+    category: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Full-text search across sample name, category, folder, and tags.
+
+    Multi-word queries are AND-combined by FTS5 by default and results are
+    ranked by BM25 (lower rank value = better match).
+
+    Parameters
+    ----------
+    query:
+        Raw search string.  Tokens are passed to FTS5 with implicit AND.
+    category:
+        If given, results are filtered to this category (case-insensitive).
+    limit:
+        Maximum number of results.
+
+    Returns
+    -------
+    list[dict]
+        Each dict has all columns from ``samples`` plus ``rank`` (BM25 score)
+        and ``tags`` (list[str]).
+    """
+    if not query or not query.strip():
+        return []
+
+    # Build an FTS5 query: quote each whitespace-delimited token so that
+    # punctuation / special characters don't break the parser.  Multiple tokens
+    # are implicitly AND-joined.
+    tokens = [t.strip() for t in query.split() if t.strip()]
+    if not tokens:
+        return []
+    # Escape double-quotes inside tokens, then wrap each in double quotes.
+    fts_query = " ".join('"' + t.replace('"', '""') + '"' for t in tokens)
+
+    sql = """
+        SELECT s.*, bm25(samples_fts) AS rank
+        FROM samples_fts
+        JOIN samples s ON s.id = samples_fts.rowid
+        WHERE samples_fts MATCH ?
+    """
+    params: list[Any] = [fts_query]
+
+    if category:
+        sql += " AND lower(s.category) = lower(?)"
+        params.append(category)
+
+    sql += " ORDER BY rank ASC LIMIT ?"
+    params.append(limit)
+
+    rows = conn.execute(sql, params).fetchall()
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        d = dict(row)
+        sid = d["id"]
+        d["tags"] = get_sample_tags(conn, sid)
+        results.append(d)
+    return results
+
+
+def get_sample_by_path(conn: sqlite3.Connection, path: str) -> dict[str, Any] | None:
+    """Fetch a single sample (and its tags) by absolute file path."""
+    if not path:
+        return None
+    row = conn.execute("SELECT * FROM samples WHERE path = ?", (path,)).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    d["tags"] = get_sample_tags(conn, d["id"])
+    if d.get("strings_json"):
+        try:
+            d["strings"] = json.loads(d["strings_json"])
+        except (json.JSONDecodeError, TypeError):
+            d["strings"] = []
+    else:
+        d["strings"] = []
+    return d
+
+
+def get_sample_tags(conn: sqlite3.Connection, sample_id: int) -> list[str]:
+    """Return the list of tags for a sample (ordered by insertion)."""
+    rows = conn.execute(
+        "SELECT tag FROM tags WHERE sample_id = ? ORDER BY id", (sample_id,)
+    ).fetchall()
+    return [r[0] for r in rows] if rows else []
+
+
+# ---------------------------------------------------------------------------
+# Public API — scan tracking
+# ---------------------------------------------------------------------------
+
+def record_scan(
+    conn: sqlite3.Connection,
+    root_path: str,
+    files_found: int,
+    files_new: int,
+    files_updated: int,
+) -> None:
+    """Record a completed (or running) scan in ``scan_history``.
+
+    A row is inserted with ``status='completed'`` and ``completed_at=now``.
+    """
+    now = _now_iso()
+    conn.execute(
+        """
+        INSERT INTO scan_history
+            (root_path, started_at, completed_at, files_found,
+             files_new, files_updated, status)
+        VALUES (?, ?, ?, ?, ?, ?, 'completed')
+        """,
+        (root_path, now, now, files_found, files_new, files_updated),
+    )
+    conn.commit()
+
+
+def update_root(conn: sqlite3.Connection, root_path: str, file_count: int) -> None:
+    """Upsert a root folder record with the latest file count and timestamp."""
+    now = _now_iso()
+    conn.execute(
+        """
+        INSERT INTO roots (path, last_scanned, file_count)
+        VALUES (?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET
+            last_scanned = excluded.last_scanned,
+            file_count   = excluded.file_count
+        """,
+        (root_path, now, file_count),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Public API — stats
+# ---------------------------------------------------------------------------
+
+def get_stats(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Return summary statistics about the database.
+
+    Keys: ``total_samples``, ``by_category`` (dict),
+    ``by_ext`` (dict), ``analyzed_count``.
+    """
+    total_row = conn.execute("SELECT COUNT(*) FROM samples").fetchone()
+    total_samples = total_row[0] if total_row else 0
+
+    cat_rows = conn.execute(
+        "SELECT category, COUNT(*) AS cnt FROM samples GROUP BY category ORDER BY cnt DESC"
+    ).fetchall()
+    by_category = {r[0]: r[1] for r in cat_rows}
+
+    ext_rows = conn.execute(
+        "SELECT ext, COUNT(*) AS cnt FROM samples GROUP BY ext ORDER BY cnt DESC"
+    ).fetchall()
+    by_ext = {r[0]: r[1] for r in ext_rows}
+
+    analyzed_row = conn.execute("SELECT COUNT(*) FROM analysis_cache").fetchone()
+    analyzed_count = analyzed_row[0] if analyzed_row else 0
+
+    return {
+        "total_samples": total_samples,
+        "by_category": by_category,
+        "by_ext": by_ext,
+        "analyzed_count": analyzed_count,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public API — migration
+# ---------------------------------------------------------------------------
+
+def migrate_from_jsonl(conn: sqlite3.Connection, jsonl_path: str) -> int:
+    """Migrate records from a legacy JSONL index into the database.
+
+    Each line is a JSON object matching the record format produced by
+    :mod:`librarian.index`.  Existing samples (matched by ``path``) are
+    updated in place.
+
+    Returns the number of records migrated.
+    """
+    path = Path(jsonl_path)
+    if not path.exists():
+        return 0
+
+    count = 0
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not record.get("path"):
+                continue
+            upsert_sample(conn, record)
+            count += 1
+
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Public API — teardown
+# ---------------------------------------------------------------------------
+
+def close_db(conn: sqlite3.Connection) -> None:
+    """Commit any pending transaction and close the connection safely."""
+    try:
+        conn.commit()
+    except sqlite3.Error:
+        pass
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def _main(argv: list[str] | None = None) -> int:
+    """Initialise the database and optionally migrate from JSONL."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Initialise / migrate the Sample Librarian SQLite database.",
+    )
+    parser.add_argument(
+        "--db",
+        default=DEFAULT_DB_PATH,
+        help=f"Database path (default: {DEFAULT_DB_PATH})",
+    )
+    parser.add_argument(
+        "--jsonl",
+        default="data/samples_index.jsonl",
+        help="JSONL index to migrate from (skipped if file doesn't exist)",
+    )
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="Print database stats after initialisation / migration",
+    )
+    args = parser.parse_args(argv)
+
+    db_path = os.path.expanduser(args.db) if args.db.startswith("~") else args.db
+    jsonl_path = os.path.expanduser(args.jsonl) if args.jsonl.startswith("~") else args.jsonl
+
+    print(f"Initialising database at {db_path} ...", file=sys.stderr)
+    init_db(db_path)
+
+    conn = get_db(db_path)
+    try:
+        if os.path.exists(jsonl_path):
+            print(f"Migrating from {jsonl_path} ...", file=sys.stderr)
+            migrated = migrate_from_jsonl(conn, jsonl_path)
+            print(f"  Migrated {migrated} records.", file=sys.stderr)
+        else:
+            print(f"No JSONL at {jsonl_path} — skipping migration.", file=sys.stderr)
+
+        if args.stats:
+            stats = get_stats(conn)
+            print(file=sys.stderr)
+            print("Database statistics:", file=sys.stderr)
+            print(f"  Total samples:  {stats['total_samples']}", file=sys.stderr)
+            print(f"  Analyzed:       {stats['analyzed_count']}", file=sys.stderr)
+            print(f"  Categories:     {len(stats['by_category'])}", file=sys.stderr)
+            print(f"  Extensions:     {len(stats['by_ext'])}", file=sys.stderr)
+            top_cats = list(stats["by_category"].items())[:8]
+            if top_cats:
+                cat_str = ", ".join(f"{k}({v})" for k, v in top_cats)
+                print(f"  Top categories: {cat_str}", file=sys.stderr)
+    finally:
+        close_db(conn)
+
+    print("Done.", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
