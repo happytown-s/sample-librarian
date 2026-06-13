@@ -16,6 +16,7 @@ Setup:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import socket
 from typing import Any
@@ -147,7 +148,7 @@ class LiveAgentClient:
         self._sock.settimeout(self._timeout)
         try:
             self._sock.connect((self._host, self._port))
-        except (ConnectionRefusedError, socket.timeout, OSError) as e:
+        except (ConnectionRefusedError, TimeoutError, OSError) as e:
             self._sock = None
             raise LiveAgentNotAvailable(str(e)) from e
 
@@ -161,10 +162,8 @@ class LiveAgentClient:
     def close(self) -> None:
         """Close the TCP connection."""
         if self._sock is not None:
-            try:
+            with contextlib.suppress(OSError):
                 self._sock.close()
-            except OSError:
-                pass
             self._sock = None
 
     # ── Core send ──
@@ -194,7 +193,7 @@ class LiveAgentClient:
                 self._sock.sendall(data)
                 response = self._recv_response()
             return json.loads(response.decode().strip())
-        except (ConnectionResetError, BrokenPipeError, socket.timeout, OSError) as e:
+        except (ConnectionResetError, BrokenPipeError, TimeoutError, OSError) as e:
             if self._auto_reconnect:
                 self._reconnect()
                 self._sock.sendall(data)
