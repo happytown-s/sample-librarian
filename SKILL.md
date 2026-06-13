@@ -15,9 +15,20 @@ with a target key using the Camelot Wheel.
 **Works standalone.** Optional Ableton Live integration via
 [live-agent-remote](https://github.com/happytown-s/live-agent-remote).
 
-## MCP Tools (7 total)
+## MCP Tools (9 total)
 
 ### Core (always available)
+
+- **`librarian_add_root(path, rebuild_index=True)`**
+  Add a sample folder to config.local.py and auto re-index.
+  Validates the path exists, prevents duplicates, persists across restarts.
+  If config.local.py doesn't exist, creates it from template.
+  This is the preferred way to register new sample folders — no manual file editing needed.
+
+- **`librarian_list_roots()`**
+  Show all configured sample folders with disk status and audio file counts.
+  Also shows index status (exists, file count, last build time).
+  Use this to check what's indexed before searching.
 
 - **`librarian_search(terms, limit=20, category="", ext="")`**
   Search the sample index. All terms must match (AND logic).

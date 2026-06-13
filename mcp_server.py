@@ -1,11 +1,13 @@
 """MCP Server for Sample Librarian.
 
-Exposes 7 tools for AI agents to search, analyze, and recommend samples.
+Exposes 9 tools for AI agents to search, analyze, and recommend samples.
 Optionally integrates with live-agent-remote for Ableton Live preview.
 
 Core tools (always available):
   - librarian_search       — Search sample index by keywords
   - librarian_index        — Build/rebuild the sample index
+  - librarian_add_root     — Add a folder to config + auto re-index
+  - librarian_list_roots   — Show configured roots and index status
   - librarian_analyze      — Analyze audio file (pitch, BPM, key)
   - librarian_analyze_folder — Batch analyze a folder
   - librarian_recommend    — Recommend key-compatible samples
@@ -120,6 +122,159 @@ def librarian_index(
     )
     count, summary = build_index(config)
     return json.dumps(summary, ensure_ascii=False)
+
+
+@mcp.tool()
+def librarian_add_root(
+    path: str,
+    rebuild_index: bool = True,
+) -> str:
+    """Add a sample folder to config.local.py and optionally re-index.
+
+    Persists the path so it's included in all future searches and recommendations.
+    If config.local.py doesn't exist yet, creates it from the template.
+
+    Args:
+        path: Absolute or ~ path to the folder to add
+        rebuild_index: If True (default), immediately scan all configured roots
+
+    Returns:
+        JSON with updated roots list and index summary (if rebuilt).
+    """
+    import os
+    base_dir = Path(__file__).parent
+    local_path = base_dir / "config.local.py"
+
+    # Normalize the input path
+    clean_path = os.path.expanduser(path)
+    if not os.path.isabs(clean_path):
+        clean_path = os.path.abspath(clean_path)
+
+    # Validate the path exists
+    if not os.path.isdir(clean_path):
+        return json.dumps({"error": f"Directory not found: {clean_path}"})
+
+    # Load current SAMPLES_ROOTS from config
+    from config import get_samples_roots
+    current_roots = get_samples_roots()
+
+    # Check for duplicate
+    already = any(os.path.expanduser(r) == clean_path for r in current_roots)
+    if already:
+        return json.dumps({
+            "status": "already_exists",
+            "roots": current_roots,
+            "message": f"Path already in config: {clean_path}",
+        })
+
+    # Read or create config.local.py
+    if local_path.exists():
+        content = local_path.read_text(encoding="utf-8")
+    else:
+        # Create from template
+        template = (base_dir / "config.example.py").read_text(encoding="utf-8")
+        content = template
+
+    # Add the new path to SAMPLES_ROOTS
+    # Strategy: find the SAMPLES_ROOTS list and append
+    lines = content.split("\n")
+    new_lines = []
+    in_roots = False
+    roots_end_idx = None
+    for i, line in enumerate(lines):
+        if "SAMPLES_ROOTS" in line and "=" in line and "[" in line:
+            in_roots = True
+        if in_roots and "]" in line:
+            roots_end_idx = i
+            in_roots = False
+        new_lines.append(line)
+
+    # Insert before the closing ]
+    if roots_end_idx is not None:
+        new_lines.insert(roots_end_idx, f'    "{clean_path}",')
+    else:
+        # No SAMPLES_ROOTS found — append the whole block
+        new_lines.append("")
+        new_lines.append("SAMPLES_ROOTS = [")
+        new_lines.append(f'    "{clean_path}",')
+        new_lines.append("]")
+
+    local_path.write_text("\n".join(new_lines), encoding="utf-8")
+
+    result = {
+        "status": "added",
+        "path": clean_path,
+        "config_file": str(local_path),
+    }
+
+    # Re-index if requested
+    if rebuild_index:
+        all_roots = current_roots + [clean_path]
+        config = IndexConfig(
+            roots=all_roots,
+            output=_get_index_path(),
+            scan_presets=True,
+        )
+        count, summary = build_index(config)
+        result["index_summary"] = summary
+        result["total_roots"] = len(all_roots)
+
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
+def librarian_list_roots() -> str:
+    """Show all configured sample folders and current index status.
+
+    Returns:
+        JSON with:
+        - roots: list of configured folder paths
+        - index_exists: whether index file is present
+        - index_size: number of indexed files (if available)
+        - index_modified: last build timestamp
+    """
+    import time
+
+    from config import get_samples_roots
+    roots = get_samples_roots()
+
+    index_path = _get_index_path()
+    index_exists = os.path.isfile(index_path)
+    index_size = 0
+    index_mtime = None
+
+    if index_exists:
+        # Count lines in JSONL
+        with open(index_path, "r", encoding="utf-8") as f:
+            index_size = sum(1 for _ in f)
+        mtime = os.path.getmtime(index_path)
+        index_mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
+
+    # Also show which roots actually exist on disk
+    root_status = []
+    for r in roots:
+        expanded = os.path.expanduser(r)
+        exists = os.path.isdir(expanded)
+        file_count = 0
+        if exists:
+            for ext in (".wav", ".aiff", ".aif", ".mp3", ".ogg", ".flac"):
+                file_count += sum(
+                    1 for _ in Path(expanded).rglob(f"*{ext}")
+                )
+        root_status.append({
+            "path": r,
+            "exists": exists,
+            "audio_files": file_count,
+        })
+
+    return json.dumps({
+        "roots": root_status,
+        "index": {
+            "exists": index_exists,
+            "indexed_files": index_size,
+            "last_built": index_mtime,
+        },
+    }, ensure_ascii=False)
 
 
 @mcp.tool()

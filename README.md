@@ -5,6 +5,7 @@ Works standalone, or integrates with [live-agent-remote](https://github.com/happ
 
 ## Features
 
+- **Manage Roots** — Add sample folders to config with auto re-index
 - **Index** — Scan any sample folder, extract metadata (category, tags, file info)
 - **Search** — Keyword search with scoring (name > category > tags > content)
 - **Analyze** — librosa-based pitch detection, BPM, key estimation
@@ -16,9 +17,11 @@ Works standalone, or integrates with [live-agent-remote](https://github.com/happ
 ```
                     ┌──────────────────────────┐
   AI Agent          │   sample-librarian       │
-    │               │   MCP Server (7 tools)   │
+    │               │   MCP Server (9 tools)   │
     ├── librarian_search        ──┐            │
-    ├── librarian_analyze         │ Core (standalone)
+    ├── librarian_add_root        │ Core (standalone)
+    ├── librarian_list_roots      │            │
+    ├── librarian_analyze         │            │
     ├── librarian_recommend       │            │
     ├── librarian_preview ────────┤            │
     └── librarian_load_to_pad     │ Optional   │
@@ -42,10 +45,10 @@ git clone https://github.com/happytown-s/sample-librarian.git
 cd sample-librarian
 bash setup.sh
 
-# Edit config with your sample paths
-vim config.local.py
+# Add sample folders (auto-indexes on add)
+.venv/bin/python3 -c "from mcp_server import librarian_add_root; print(librarian_add_root('~/Music/Ableton/User Library/Samples'))"
 
-# Build index
+# Or build index manually
 .venv/bin/python3 -m librarian.index --root ~/path/to/samples
 
 # Search
@@ -76,13 +79,15 @@ Command: /path/to/sample-librarian/.venv/bin/python3
 Args: [/path/to/sample-librarian/mcp_server.py]
 ```
 
-## MCP Tools (7 total)
+## MCP Tools (9 total)
 
 ### Core (always available)
 
 | Tool | Description |
 |------|-------------|
 | `librarian_search` | Search index by keywords, category, extension |
+| `librarian_add_root` | Add folder to config + auto re-index |
+| `librarian_list_roots` | Show configured roots and index status |
 | `librarian_index` | Build/rebuild sample index from folders |
 | `librarian_analyze` | Analyze file: pitch, BPM, key, duration |
 | `librarian_analyze_folder` | Batch analyze folder (sorted by pitch) |
@@ -123,6 +128,7 @@ mcp_servers:
 ### Typical Workflow
 
 ```
+0. librarian_add_root("~/Music/Ableton/User Library/Samples")  → register folder + auto index
 1. librarian_recommend("Fm", category="Kick")     → get compatible kicks
 2. librarian_preview("/path/to/kick.wav")          → preview in Ableton
 3. librarian_load_to_pad("/path/to/kick.wav", ...) → load onto Drum Rack
