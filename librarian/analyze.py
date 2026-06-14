@@ -110,45 +110,64 @@ def analyze_file(file_path: str, mode: str = "full") -> dict:
     """Full audio analysis: BPM, key, duration.
 
     mode: 'full' (BPM + key + pitch), 'pitch' (pitch only), 'bpm' (BPM only)
+
+    Each analysis stage is independent — if BPM fails on a short one-shot,
+    pitch and duration are still returned. A result only has 'error' if even
+    the audio file cannot be loaded at all.
     """
     if not HAS_LIBROSA:
         return {"error": "librosa not installed. Run: pip install librosa"}
 
+    import numpy as np
+
+    # Stage 1: Load audio
     try:
-        import numpy as np
-
-        if mode == "pitch":
-            return detect_pitch(file_path)
-
         y, sr = librosa.load(file_path, sr=22050, mono=True)
-        duration = len(y) / sr
+    except Exception as e:
+        return {"file": file_path, "error": str(e)}
 
-        result = {
-            "file": file_path,
-            "duration": round(duration, 2),
-            "sample_type": _classify_duration(duration),
-        }
+    duration = len(y) / sr
 
-        if mode in ("full", "bpm"):
+    result = {
+        "file": file_path,
+        "duration": round(duration, 2),
+        "sample_type": _classify_duration(duration),
+    }
+
+    if mode == "pitch":
+        pitch_result = detect_pitch(file_path)
+        result.update({
+            "pitch": pitch_result.get("note_name"),
+            "note_number": pitch_result.get("note_number"),
+            "is_atonal": pitch_result.get("is_atonal", False),
+        })
+        return result
+
+    # Stage 2: BPM (may fail on short one-shots — that's OK)
+    if mode in ("full", "bpm"):
+        try:
             tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
             result["bpm"] = round(float(tempo), 1)
+        except Exception:
+            pass  # Short one-shot — no BPM, continue
 
-        if mode == "full":
-            # Pitch detection
-            pitch_result = detect_pitch(file_path)
-            result["pitch"] = pitch_result.get("note_name")
-            result["note_number"] = pitch_result.get("note_number")
-            result["is_atonal"] = pitch_result.get("is_atonal", False)
+    if mode == "full":
+        # Stage 3: Pitch detection (independent of BPM)
+        pitch_result = detect_pitch(file_path)
+        result["pitch"] = pitch_result.get("note_name")
+        result["note_number"] = pitch_result.get("note_number")
+        result["is_atonal"] = pitch_result.get("is_atonal", False)
 
-            # Rough key estimation via chroma
+        # Stage 4: Key estimation (may fail on very short clips — OK)
+        try:
             chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
             chroma_mean = chroma.mean(axis=1)
             estimated_tonic = PITCH_CLASS_NAMES[int(np.argmax(chroma_mean))]
             result["estimated_key_root"] = estimated_tonic
+        except Exception:
+            pass
 
-        return result
-    except Exception as e:
-        return {"file": file_path, "error": str(e)}
+    return result
 
 
 def _classify_duration(duration: float) -> str:
