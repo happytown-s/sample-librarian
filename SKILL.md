@@ -60,21 +60,55 @@ with a target key using the Camelot Wheel.
 Integration tools auto-detect LiveAgent. If unavailable, they return an
 error with setup instructions — core tools keep working.
 
-## Typical Workflow
+## Two-Phase Workflow (MANDATORY)
+
+This project has TWO distinct phases.
+**Never skip Phase 1 for un-indexed folders.**
+**Never bypass the DB by scanning the filesystem directly to pick samples.**
+
+### Phase 1 — Index & Analyze (only when user specifies a NEW folder)
+
+The user says "analyze this folder" or "add these samples" → index first.
 
 ```
-# 1. Find compatible kicks for F minor
-librarian_recommend(target_key="Fm", category="Kick", analyze=True)
+# 1. Register folder
+librarian_add_root("/path/to/new/sample/folder")
 
-# 2. Preview a candidate in Ableton
-librarian_preview("/path/to/kick.wav")
+# 2. Build index (scan files, extract metadata from filenames/paths)
+librarian_index(roots=["/path/to/new/sample/folder"])
 
-# 3. Load onto Drum Rack pad 36 (C1)
-librarian_load_to_pad("/path/to/kick.wav", track_index=4, pad_index=36)
+# 3. Analyze (pitch, BPM, key detection via librosa)
+librarian_analyze_folder(folder_path="/path/to/new/sample/folder", mode="full")
+```
 
-# 4. (via live-agent-remote) Write a drum pattern
+### Phase 2 — Search, Recommend & Load (ALL subsequent usage)
+
+**Always use the DB.** Never access the filesystem directly to find or pick samples.
+
+```
+# 1. Search DB for candidates
+librarian_search(terms="808 kick punchy", category="Kick", limit=10)
+
+# 2. Harmonic recommendation via Camelot Wheel
+librarian_recommend(target_key="Fm", category="Kick", limit=5)
+
+# 3. Preview in Ableton (optional)
+librarian_preview("/path/from/db/result.wav", track_index=4, slot_index=0)
+
+# 4. Load onto Drum Rack pad
+librarian_load_to_pad("/path/from/db/result.wav", track_index=4, pad_index=36)
+
+# 5. Write a MIDI pattern (via live-agent-remote)
 mcp_liveagent_write_midi_notes(track_index=4, slot_index=0, notes=[...])
 ```
+
+### Anti-Patterns (NEVER do these)
+
+- ❌ Scanning the filesystem (os.listdir, find, ls) to pick samples when the DB already has them indexed
+- ❌ Guessing sample quality from filenames without analysis data
+- ❌ Loading samples into Ableton from paths not verified in the DB
+- ❌ Running `librarian_analyze` on already-analyzed samples (wastes time)
+- ❌ Mixing Phase 1 and Phase 2 — if the folder is already in `librarian_list_roots`, skip to Phase 2
 
 ## Camelot Wheel Reference
 
