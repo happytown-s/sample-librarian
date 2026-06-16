@@ -31,21 +31,99 @@ PRINTABLE_RE = re.compile(rb"[\x20-\x7e]{4,}")
 
 # Common category names found in sample libraries
 CATEGORY_SYNONYMS = {
+    # Kick
     "kick": "Kick", "kicks": "Kick", "bd": "Kick", "bassdrum": "Kick",
+    "bass drum": "Kick", "bassdrums": "Kick", "bottom": "Kick",
+    # Snare
     "snare": "Snare", "snares": "Snare", "sd": "Snare",
-    "hihat": "HiHat", "hi-hat": "HiHat", "hat": "HiHat", "hh": "HiHat",
+    # Hi-hat
+    "hihat": "Hat", "hi-hat": "Hat", "hihat": "Hat", "hat": "Hat", "hh": "Hat",
+    # Clap
     "clap": "Clap", "claps": "Clap",
+    # Percussion & World
     "perc": "Percussion", "percussion": "Percussion",
-    "cymbal": "Cymbal", "crash": "Cymbal", "ride": "Cymbal", "crashs": "Cymbal",
-    "tom": "Tom", "toms": "Tom",
-    "shaker": "Shaker", "tambourine": "Shaker",
-    "bass": "Bass", "sub": "Bass",
-    "lead": "Lead", "synth": "Lead",
-    "pad": "Pad", "pads": "Pad",
+    "shaker": "Hat", "tambourine": "Hat",
+    "conga": "Percussion", "congas": "Percussion", "bongo": "Percussion", "bongos": "Percussion",
+    "timbale": "Percussion", "timbales": "Percussion",
+    "djembe": "Percussion", "tabla": "Percussion", "cajon": "Percussion",
+    "triangle": "Percussion", "cowbell": "Percussion", "cowbells": "Percussion",
+    "agogo": "Percussion", "whistle": "Percussion", "guiro": "Percussion",
+    "woodblock": "Percussion", "block": "Percussion",
+    # Cymbal
+    "cymbal": "Cymbal", "cymbals": "Cymbal",
+    "crash": "Cymbal", "crashs": "Cymbal", "crashes": "Cymbal",
+    "ride": "Cymbal", "rides": "Cymbal",
+    "splash": "Cymbal", "splashes": "Cymbal",
+    "chinese": "Cymbal", "swell": "Cymbal", "bell": "Cymbal", "bells": "Cymbal",
+    # Tom
+    "tom": "Tom", "toms": "Tom", "tomtom": "Tom",
+    # Drum (generic — fallback for drum-specific folders without subcategory)
+    "drum": "Percussion", "drums": "Percussion",
+    # Rim
+    "rim": "Snare", "rimshot": "Snare", "rimshots": "Snare",
+    "stick": "Snare", "sticks": "Snare",
+    # Hand drum
+    "handdrum": "Percussion",
+    # Bass
+    "bass": "Bass", "sub": "Bass", "808": "Bass",
+    "subbass": "Bass", "sub-bass": "Bass",
+    # Synth / Lead
+    "lead": "Synth", "synth": "Synth", "synths": "Synth",
+    "synth note": "Synth", "synthnote": "Synth",
+    # Pad / Chord
+    "pad": "Pad", "pads": "Pad", "chord": "Pad", "chords": "Pad",
+    # Stab / Hit
+    "stab": "Synth", "stab&hit": "Synth", "stabs": "Synth",
+    "hit": "Percussion", "hits": "Percussion",
+    # FX
     "fx": "FX", "effect": "FX", "effects": "FX",
-    "vocal": "Vocal", "vox": "Vocal", "voice": "Vocal",
+    "sweep": "FX", "sweep&swell": "FX", "swell": "FX",
+    "riser": "FX", "risers": "FX", "fall": "FX", "falls": "FX",
+    "downlifter": "FX", "uplifter": "FX", "downlift": "FX", "uplift": "FX",
+    "transition": "FX", "impact": "FX", "impacts": "FX",
+    "zap": "FX", "blip": "FX", "blip&blop": "FX",
+    "glitch": "FX", "noise": "FX",
+    "ambience": "FX", "ambient": "FX",
+    "distortion": "FX", "crackle": "FX", "buzz": "FX",
+    "click": "FX", "clicks": "FX",
+    # Vocal
+    "vocal": "Vocal", "vox": "Vocal", "voice": "Vocal", "voices": "Vocal",
+    # Loop
     "loop": "Loop", "loops": "Loop",
-    "one-shot": "OneShot", "oneshot": "OneShot", "one_shot": "OneShot",
+    "combo": "Loop",
+    # Metallic / Mallet
+    "metallic": "Percussion", "metal": "Percussion",
+    "mallet": "Percussion", "malletdrum": "Percussion",
+    # Wooden
+    "wooden": "Percussion", "wood": "Percussion",
+    # Lick / Phrase
+    "lick": "Synth", "phrase": "Synth", "phrases": "Synth",
+    # Other instrument folders
+    "strings": "Synth", "string": "Synth",
+    "flute": "Synth", "guitar": "Synth", "piano": "Synth",
+    "organ": "Synth", "brass": "Synth",
+}
+
+# Filename-only keywords (used as fallback when folder match fails)
+FILENAME_CATEGORY_KEYWORDS = {
+    "kick": "Kick", "kicks": "Kick", "bd ": "Kick",
+    "snare": "Snare", "sd ": "Snare",
+    "hihat": "Hat", "hi-hat": "Hat", "openhat": "Hat", "closedhat": "Hat",
+    "ch ": "Hat", "oh ": "Hat",
+    "clap": "Clap",
+    "perc": "Percussion", "conga": "Percussion", "bongo": "Percussion",
+    "crash": "Cymbal", "ride": "Cymbal", "splash": "Cymbal",
+    "tom ": "Tom",
+    "shaker": "Hat", "tamb": "Hat",
+    "bass": "Bass", "sub ": "Bass", "808": "Bass",
+    "synth": "Synth", "lead": "Synth",
+    "pad ": "Pad", "chord": "Pad", "stab": "Synth",
+    "fx ": "FX", "sweep": "FX", "riser": "FX",
+    "vocal": "Vocal", "vox": "Vocal",
+    "loop": "Loop",
+    "rim": "Snare", "rimshot": "Snare",
+    "noise": "FX", "glitch": "FX", "zap": "FX",
+    "impact": "FX", "click": "FX", "blip": "FX",
 }
 
 
@@ -62,12 +140,28 @@ def _resolve(path: str) -> Path:
 
 
 def _infer_category(file_path: Path) -> str:
-    """Infer category from path components."""
+    """Infer category from path components, then filename as fallback."""
+    # 1) フォルダ名から推定
     parts = file_path.parts
     for part in reversed(parts):
         key = part.lower().replace(" ", "").replace("_", "")
         if key in CATEGORY_SYNONYMS:
             return CATEGORY_SYNONYMS[key]
+    # 2) フォルダ名で見つからなかったら、部分マッチ（スペース区切りで各トークンをチェック）
+    for part in reversed(parts):
+        part_low = part.lower().replace("_", " ")
+        for token in part_low.split():
+            if token in CATEGORY_SYNONYMS:
+                return CATEGORY_SYNONYMS[token]
+    # 3) ファイル名からフォールバック
+    name_low = file_path.stem.lower().replace("_", " ")
+    for token in name_low.split():
+        if token in CATEGORY_SYNONYMS:
+            return CATEGORY_SYNONYMS[token]
+    # 4) ファイル名内の部分文字列マッチ（短いキーワードのみ）
+    for kw, cat in FILENAME_CATEGORY_KEYWORDS.items():
+        if kw in name_low:
+            return cat
     return "Other"
 
 
