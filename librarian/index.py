@@ -37,7 +37,7 @@ CATEGORY_SYNONYMS = {
     # Snare
     "snare": "Snare", "snares": "Snare", "sd": "Snare",
     # Hi-hat
-    "hihat": "Hat", "hi-hat": "Hat", "hihat": "Hat", "hat": "Hat", "hh": "Hat",
+    "hihat": "Hat", "hi-hat": "Hat", "hat": "Hat", "hh": "Hat",
     # Clap
     "clap": "Clap", "claps": "Clap",
     # Percussion & World
@@ -77,7 +77,7 @@ CATEGORY_SYNONYMS = {
     "hit": "Percussion", "hits": "Percussion",
     # FX
     "fx": "FX", "effect": "FX", "effects": "FX",
-    "sweep": "FX", "sweep&swell": "FX", "swell": "FX",
+    "sweep": "FX", "sweep&swell": "FX",
     "riser": "FX", "risers": "FX", "fall": "FX", "falls": "FX",
     "downlifter": "FX", "uplifter": "FX", "downlift": "FX", "uplift": "FX",
     "transition": "FX", "impact": "FX", "impacts": "FX",
