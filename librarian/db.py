@@ -734,6 +734,107 @@ def scan_root_to_db(
             "files_updated": files_updated, "root": str(root)}
 
 
+def recommend_samples_db(
+    conn: sqlite3.Connection,
+    target_key: str,
+    terms: list[str] | None = None,
+    category: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Recommend samples harmonically compatible with *target_key*.
+
+    Uses Camelot Wheel matching via :func:`librarian.analyze.get_compatible_keys`
+    against keys stored in ``analysis_cache``.  No real-time analysis is
+    performed — only previously-analysed samples are considered.
+
+    Selection rules:
+
+    * Samples with ``is_atonal = 1`` (hi-hats, noise, FX) are **always**
+      included — they have no key constraint.
+    * Tonal samples are included only if their ``key`` is in the compatible
+      set for *target_key*.
+    * Samples without analysis data (no ``analysis_cache`` row) are excluded.
+
+    *terms* and *category* narrow the candidate pool via FTS5 search before
+    key filtering.
+
+    Parameters
+    ----------
+    target_key:
+        Target key, e.g. ``"Fm"``, ``"C"``, ``"Am"``.
+    terms:
+        Optional search terms to filter candidates.
+    category:
+        Optional category filter.
+    limit:
+        Maximum results.
+
+    Returns
+    -------
+    list[dict]
+        Enriched sample dicts (via :func:`enrich_result`), preserving
+        candidate order.
+    """
+    from .analyze import get_compatible_keys
+
+    compatible_keys = set(get_compatible_keys(target_key))
+
+    # Gather candidates via FTS5 if terms given, else scan broadly.
+    query = " ".join(terms) if terms else ""
+    if query:
+        candidates = search_samples(conn, query, category=category, limit=limit * 5)
+    else:
+        # No terms: fetch recent samples, optionally filtered by category.
+        if category:
+            rows = conn.execute(
+                "SELECT * FROM samples WHERE lower(category) = lower(?) "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (category, limit * 5),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM samples ORDER BY updated_at DESC LIMIT ?",
+                (limit * 5,),
+            ).fetchall()
+        candidates = []
+        for row in rows:
+            d = dict(row)
+            d["tags"] = get_sample_tags(conn, d["id"])
+            candidates.append(d)
+
+    if not candidates:
+        return []
+
+    # Batch-fetch analysis for candidates.
+    sample_ids = [c["id"] for c in candidates if "id" in c]
+    analysis_map: dict[int, dict] = {}
+    if sample_ids:
+        placeholders = ",".join("?" * len(sample_ids))
+        rows = conn.execute(
+            f"SELECT * FROM analysis_cache WHERE sample_id IN ({placeholders})",
+            sample_ids,
+        ).fetchall()
+        for row in rows:
+            d = dict(row)
+            analysis_map[d["sample_id"]] = d
+
+    compatible: list[dict[str, Any]] = []
+    for c in candidates:
+        sid = c.get("id")
+        analysis = analysis_map.get(sid) if sid else None
+        if analysis is None:
+            continue  # no analysis → cannot determine key → skip
+        is_atonal = bool(analysis.get("is_atonal", 0))
+        if is_atonal:
+            compatible.append(enrich_result(c, analysis))
+            continue
+        key_val = analysis.get("key")
+        if key_val and key_val in compatible_keys:
+            compatible.append(enrich_result(c, analysis))
+
+    return compatible[:limit]
+
+
 # ---------------------------------------------------------------------------
 # Public API — stats
 # ---------------------------------------------------------------------------

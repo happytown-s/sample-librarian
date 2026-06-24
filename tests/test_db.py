@@ -502,3 +502,106 @@ def test_scan_root_to_db_empty_folder(tmp_path: Path):
         assert history["files_found"] == 0
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# recommend_samples_db
+# ---------------------------------------------------------------------------
+
+def test_recommend_samples_db(db_conn, sample_factory):
+    """recommend_samples_db returns harmonically compatible samples."""
+    from librarian.db import recommend_samples_db, upsert_analysis
+
+    # target_key "Fm" → compatible: ["Ab", "Fm", "A#m", "Cm"]
+    # DB stores major-form keys; "Ab" is the major-form key in Fm's set.
+
+    # Compatible: key "Ab" (in Fm's compatible set)
+    sid_compatible = sample_factory(
+        db_conn, name="Ab Bass", category="Bass", path="/r/bass_ab.wav",
+    )
+    upsert_analysis(db_conn, sid_compatible, {
+        "key": "Ab", "pitch": "Ab", "note_number": 44,
+        "is_atonal": False, "sample_type": "loop",
+    })
+
+    # Incompatible: key "E" (NOT in Fm's compatible set)
+    sid_incompatible = sample_factory(
+        db_conn, name="E Bass", category="Bass", path="/r/bass_e.wav",
+    )
+    upsert_analysis(db_conn, sid_incompatible, {
+        "key": "E", "pitch": "E", "note_number": 40,
+        "is_atonal": False, "sample_type": "loop",
+    })
+
+    # Atonal: always included regardless of key
+    sid_atonal = sample_factory(
+        db_conn, name="Closed Hat", category="HiHat", path="/r/hat.wav",
+    )
+    upsert_analysis(db_conn, sid_atonal, {
+        "is_atonal": True, "sample_type": "oneshot",
+    })
+
+    results = recommend_samples_db(
+        db_conn, target_key="Fm", terms=["bass", "hat"], limit=20,
+    )
+    names = [r["name"] for r in results]
+
+    # Compatible bass included, incompatible bass excluded, atonal hat included
+    assert "Ab Bass" in names
+    assert "E Bass" not in names
+    assert "Closed Hat" in names
+
+
+def test_recommend_samples_db_no_terms(db_conn, sample_factory):
+    """recommend_samples_db with no terms falls back to recent samples."""
+    from librarian.db import recommend_samples_db, upsert_analysis
+
+    # Compatible + category filter (no terms)
+    sid = sample_factory(
+        db_conn, name="Ab Bass", category="Bass", path="/r2/bass_ab.wav",
+    )
+    upsert_analysis(db_conn, sid, {
+        "key": "Ab", "is_atonal": False, "sample_type": "loop",
+    })
+    # Incompatible, same category
+    sid2 = sample_factory(
+        db_conn, name="E Bass", category="Bass", path="/r2/bass_e.wav",
+    )
+    upsert_analysis(db_conn, sid2, {
+        "key": "E", "is_atonal": False, "sample_type": "loop",
+    })
+
+    # No terms, category=Bass → should still filter by key compatibility
+    results = recommend_samples_db(
+        db_conn, target_key="Fm", terms=None, category="Bass", limit=20,
+    )
+    names = [r["name"] for r in results]
+    assert "Ab Bass" in names
+    assert "E Bass" not in names
+
+
+def test_recommend_samples_db_no_analysis(db_conn, sample_factory):
+    """Samples without analysis data are excluded from recommendations."""
+    from librarian.db import recommend_samples_db
+
+    # Sample with no analysis_cache row
+    sample_factory(
+        db_conn, name="Unknown Bass", category="Bass", path="/r3/bass.wav",
+    )
+
+    results = recommend_samples_db(
+        db_conn, target_key="Fm", terms=["bass"], limit=20,
+    )
+    names = [r["name"] for r in results]
+    assert "Unknown Bass" not in names
+    assert results == []
+
+
+def test_recommend_samples_db_no_candidates(db_conn, sample_factory):
+    """No matching candidates returns an empty list."""
+    from librarian.db import recommend_samples_db
+
+    results = recommend_samples_db(
+        db_conn, target_key="Fm", terms=["nonexistent_term_xyz"], limit=20,
+    )
+    assert results == []
