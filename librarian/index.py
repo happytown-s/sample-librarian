@@ -222,7 +222,7 @@ def _scan_folder(root: Path, scan_presets: bool = True) -> Iterable[dict]:
             record = {
                 "name": name,
                 "path": str(fpath),
-                "ext": fpath.suffix.lower(),
+                "ext": fpath.suffix.lower().lstrip("."),
                 "size": stat.st_size,
                 "category": category,
                 "folder": fpath.parent.name,

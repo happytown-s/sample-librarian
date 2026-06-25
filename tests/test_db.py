@@ -353,6 +353,33 @@ def test_compute_file_hash_path_independent(tmp_path: Path):
     assert h1 == h2, "path-independent hash should match for identical files"
 
 
+def test_scan_root_to_db_ext_normalized(tmp_path: Path):
+    """scan_root_to_db stores ext WITHOUT a leading dot (canonical form).
+
+    Bug#1: index.py used fpath.suffix.lower() which keeps the dot (.wav),
+    while batch_analyze_sqlite.py strips it (wav). Standardize on no-dot so
+    direct SQL queries and find_similar_* helpers see consistent values.
+    """
+    from librarian.db import get_db, init_db, scan_root_to_db
+
+    root = tmp_path / "ext_test"
+    root.mkdir()
+    (root / "Kick 808.wav").write_bytes(b"\x00" * 64)
+
+    db_path = str(tmp_path / "ext_test.db")
+    init_db(db_path)
+    conn = get_db(db_path)
+    try:
+        scan_root_to_db(conn, root)
+        row = conn.execute(
+            "SELECT ext FROM samples WHERE path LIKE '%Kick 808.wav'"
+        ).fetchone()
+        assert row is not None
+        assert row["ext"] == "wav", f"ext should be 'wav' (no dot), got {row['ext']!r}"
+    finally:
+        conn.close()
+
+
 def test_find_similar_by_duration(db_conn, sample_factory):
     """Samples with near-identical durations in the same category group together."""
     sid1 = sample_factory(
