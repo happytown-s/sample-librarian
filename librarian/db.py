@@ -1335,22 +1335,43 @@ def _main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Print database stats after initialisation / migration",
     )
+    parser.add_argument(
+        "--migrate",
+        metavar="JSONL",
+        default=None,
+        help="Migrate records from the given JSONL index into the database",
+    )
+    parser.add_argument(
+        "--duplicates",
+        action="store_true",
+        help="Run all duplicate / similarity checks and print a JSON report",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="With --duplicates, print the full report as JSON to stdout",
+    )
     args = parser.parse_args(argv)
 
     db_path = os.path.expanduser(args.db) if args.db.startswith("~") else args.db
-    jsonl_path = os.path.expanduser(args.jsonl) if args.jsonl.startswith("~") else args.jsonl
+    # --migrate takes precedence over --jsonl when supplied (README documents
+    # `--migrate <path>`). Fall back to --jsonl for backward compatibility.
+    migrate_path = args.migrate if args.migrate is not None else args.jsonl
+    migrate_path = (
+        os.path.expanduser(migrate_path) if migrate_path.startswith("~") else migrate_path
+    )
 
     print(f"Initialising database at {db_path} ...", file=sys.stderr)
     init_db(db_path)
 
     conn = get_db(db_path)
     try:
-        if os.path.exists(jsonl_path):
-            print(f"Migrating from {jsonl_path} ...", file=sys.stderr)
-            migrated = migrate_from_jsonl(conn, jsonl_path)
+        if migrate_path and os.path.exists(migrate_path):
+            print(f"Migrating from {migrate_path} ...", file=sys.stderr)
+            migrated = migrate_from_jsonl(conn, migrate_path)
             print(f"  Migrated {migrated} records.", file=sys.stderr)
-        else:
-            print(f"No JSONL at {jsonl_path} — skipping migration.", file=sys.stderr)
+        elif migrate_path:
+            print(f"No JSONL at {migrate_path} — skipping migration.", file=sys.stderr)
 
         if args.stats:
             stats = get_stats(conn)
@@ -1364,6 +1385,20 @@ def _main(argv: list[str] | None = None) -> int:
             if top_cats:
                 cat_str = ", ".join(f"{k}({v})" for k, v in top_cats)
                 print(f"  Top categories: {cat_str}", file=sys.stderr)
+
+        if args.duplicates:
+            report = find_all_duplicates(conn)
+            if args.json:
+                print(json.dumps(report, ensure_ascii=False))
+            else:
+                print(file=sys.stderr)
+                print("Duplicate / similarity report:", file=sys.stderr)
+                for key, groups in report.items():
+                    total = sum(g["count"] for g in groups)
+                    print(
+                        f"  {key}: {len(groups)} group(s), {total} sample(s)",
+                        file=sys.stderr,
+                    )
     finally:
         close_db(conn)
 

@@ -190,6 +190,10 @@ def analyze_file(file_path: str, mode: str = "full") -> dict:
         except Exception:
             pass
 
+        # Stage 5: Spectral centroid (timbre descriptor for duplicate detection).
+        # Pure-numpy so it works even without a librosa feature call succeeding.
+        result["spectral_centroid"] = compute_spectral_centroid(y, sr)
+
     return result
 
 
@@ -203,6 +207,61 @@ def _classify_duration(duration: float) -> str:
         return "medium_loop"
     else:
         return "long_loop"
+
+
+def compute_spectral_centroid(y, sr: int) -> float:
+    """Compute the mean spectral centroid (Hz) of a mono signal.
+
+    The spectral centroid is the amplitude-weighted mean frequency and is a
+    standard timbre descriptor ("brightness"). It is stored in
+    ``analysis_cache.spectral_centroid`` and used by
+    :func:`librarian.db.find_similar_by_spectral` to cluster samples of similar
+    timbre.
+
+    Implemented with numpy only (no librosa dependency) so it stays unit-testable
+    in CI environments that lack librosa. The signal is analysed frame by frame
+    with a Hann window and the per-frame centroids are averaged.
+
+    Returns ``0.0`` for silence (avoids division by zero).
+    """
+    import numpy as np
+
+    if y is None or len(y) == 0:
+        return 0.0
+
+    # Frame the signal (2048 samples, 50% overlap) the way librosa does so the
+    # resulting values are comparable to librosa.feature.spectral_centroid.
+    frame_length = 2048
+    hop_length = 512
+    if len(y) < frame_length:
+        # Too short to frame — analyse the whole signal as one (zero-padded) frame.
+        frames = [np.asarray(y, dtype=np.float64)]
+    else:
+        n_frames = 1 + (len(y) - frame_length) // hop_length
+        frames = [
+            y[i * hop_length: i * hop_length + frame_length].astype(np.float64)
+            for i in range(n_frames)
+        ]
+
+    window = np.hanning(frame_length)
+    # FFT bin frequencies for a frame_length-point spectrum (only positive half).
+    n = frame_length
+    freqs = np.fft.rfftfreq(n, d=1.0 / sr)
+
+    centroids: list[float] = []
+    for frame in frames:
+        # Zero-pad short trailing frames to frame_length.
+        if len(frame) < frame_length:
+            frame = np.pad(frame, (0, frame_length - len(frame)))
+        spectrum = np.abs(np.fft.rfft(frame * window))
+        total = spectrum.sum()
+        if total <= 0:
+            continue  # silent frame
+        centroids.append(float((freqs * spectrum).sum() / total))
+
+    if not centroids:
+        return 0.0
+    return round(float(np.mean(centroids)), 2)
 
 
 def analyze_folder(

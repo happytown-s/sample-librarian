@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import math
+
 from librarian.analyze import (  # noqa: I001
     CAMELOT_WHEEL,
     PITCH_CLASS_NAMES,
     _classify_duration,
+    compute_spectral_centroid,
     get_compatible_keys,
 )
 
@@ -75,3 +78,54 @@ def test_pitch_class_names():
     assert PITCH_CLASS_NAMES[7] == "G"
     assert PITCH_CLASS_NAMES[9] == "A"
     assert PITCH_CLASS_NAMES[11] == "B"
+
+
+# ---------------------------------------------------------------------------
+# Spectral centroid
+# ---------------------------------------------------------------------------
+
+def test_spectral_centroid_pure_tone_matches_frequency():
+    """純粋な正弦波のスペクトル重心はその周波数に近い値になる。
+
+    README は "spectral analysis" / "spectral fingerprint" を謳うが、
+    analyze_file() にスペクトル重心計算が未実装で、DB列は常に空だった。
+    compute_spectral_centroid は librosa に依存しない純粋関数として切り出し、
+    analyze_file から呼ぶ。
+    """
+    import numpy as np
+
+    sr = 22050
+    freq = 440.0  # A4
+    dur = 1.0
+    t = np.linspace(0, dur, int(sr * dur), endpoint=False)
+    y = np.sin(2 * math.pi * freq * t).astype(np.float32)
+
+    centroid = compute_spectral_centroid(y, sr)
+    # 正弦波の重心は周波数本身。FFT分解能と窓の影響で多少の誤差は出るので ±25Hz。
+    assert abs(centroid - freq) < 25.0, f"純音 {freq}Hz の重心 {centroid:.1f} がずれすぎ"
+
+
+def test_spectral_centroid_silence_is_zero():
+    """無音のスペクトル重心は 0（ゼロ除算を起こさない）。"""
+    import numpy as np
+
+    y = np.zeros(22050, dtype=np.float32)
+    assert compute_spectral_centroid(y, 22050) == 0.0
+
+
+def test_spectral_centroid_higher_for_high_frequency():
+    """高周波成分を含む音の方が重心が高くなる（順序の保存）。
+
+    重複検出 find_similar_by_spectral はこの値の近さでグループ化するため、
+    音色の明るさを反映できることが重要。
+    """
+    import numpy as np
+
+    sr = 22050
+    t = np.linspace(0, 1.0, sr, endpoint=False)
+    low = np.sin(2 * math.pi * 110.0 * t).astype(np.float32)   # A2
+    high = np.sin(2 * math.pi * 2000.0 * t).astype(np.float32)  # ~B6
+
+    low_c = compute_spectral_centroid(low, sr)
+    high_c = compute_spectral_centroid(high, sr)
+    assert high_c > low_c, "高周波音の方がスペクトル重心が高くなければならない"
