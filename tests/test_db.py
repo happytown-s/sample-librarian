@@ -605,3 +605,38 @@ def test_recommend_samples_db_no_candidates(db_conn, sample_factory):
         db_conn, target_key="Fm", terms=["nonexistent_term_xyz"], limit=20,
     )
     assert results == []
+
+
+def test_recommend_samples_db_sharp_key_normalization(db_conn, sample_factory):
+    """シャープ表記のキー（librosa出力）もCamelot互換判定される。
+
+    librosa は C#, D#, F#, G#, A#（シャープ）で格納するが、
+    CAMELOT_WHEEL は Db, Eb, Gb, Ab, Bb（フラット）を使う。
+    異名同音正規化なしでは39%の調性サンプルがレコメンドされない。
+    """
+    from librarian.db import recommend_samples_db, upsert_analysis
+
+    # target_key "B" → compatible: ["B", "E", "A", "Gbm"(=F#m), "Dbm"(=C#m)]
+    # つまり "A"（ナチュラル）は B の互換セットに含まれる。
+
+    # シャープ表記のサンプル: key "C#"
+    # → Camelot では Db と同じ音 → Db が target 互換セットに含まれれば推薦されるべき
+    # target_key="Db" → compatible: ["Db", "Ab", "Gb", "Bbm"(=A#m), "Fm"]
+    # "Db" 自身が含まれるので C#(=Db) サンプルは推薦されるべき
+    sid_sharp = sample_factory(
+        db_conn, name="C Sharp Lead", category="Synth",
+        path="/r4/lead_csharp.wav",
+    )
+    upsert_analysis(db_conn, sid_sharp, {
+        "key": "C#", "pitch": "C#", "note_number": 25,
+        "is_atonal": False, "sample_type": "loop",
+    })
+
+    results = recommend_samples_db(
+        db_conn, target_key="Db", terms=["lead"], limit=20,
+    )
+    names = [r["name"] for r in results]
+    assert "C Sharp Lead" in names, (
+        "シャープ表記 C# は Db と異名同音。Db の互換セットに Db が含まれるため"
+        "推薦されるべきだが、正規化なしでは見逃される（バグ C1）"
+    )

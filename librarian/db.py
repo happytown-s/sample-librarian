@@ -775,9 +775,9 @@ def recommend_samples_db(
         Enriched sample dicts (via :func:`enrich_result`), preserving
         candidate order.
     """
-    from .analyze import get_compatible_keys
+    from .analyze import get_compatible_keys, normalize_key
 
-    compatible_keys = set(get_compatible_keys(target_key))
+    compatible_keys = {normalize_key(k) for k in get_compatible_keys(target_key)}
 
     # Gather candidates via FTS5 if terms given, else scan broadly.
     query = " ".join(terms) if terms else ""
@@ -829,7 +829,7 @@ def recommend_samples_db(
             compatible.append(enrich_result(c, analysis))
             continue
         key_val = analysis.get("key")
-        if key_val and key_val in compatible_keys:
+        if key_val and normalize_key(key_val) in compatible_keys:
             compatible.append(enrich_result(c, analysis))
 
     return compatible[:limit]

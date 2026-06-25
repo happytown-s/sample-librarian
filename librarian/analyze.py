@@ -35,6 +35,29 @@ CAMELOT_TO_KEY = {v: k for k, v in CAMELOT_WHEEL.items()}
 PITCH_CLASS_NAMES = ["C", "C#", "D", "D#", "E", "F",
                      "F#", "G", "G#", "A", "A#", "B"]
 
+# Sharp → flat (enharmonic) mapping so DB keys (librosa, sharps) can be
+# compared against Camelot Wheel keys (which use flats for black keys).
+_SHARP_TO_FLAT = {
+    "C#": "Db", "D#": "Eb", "F#": "Gb", "G#": "Ab", "A#": "Bb",
+    "C#m": "Dbm", "D#m": "Ebm", "F#m": "Gbm", "G#m": "Abm", "A#m": "Bbm",
+}
+
+
+def normalize_key(key: str) -> str:
+    """Normalize a key name to its Camelot-Wheel spelling.
+
+    The DB stores keys from librosa using sharps (``C#``, ``G#``, ...), but
+    :data:`CAMELOT_WHEEL` uses flats for black keys (``Db``, ``Ab``, ...).
+    Without normalization, a sample stored as ``"C#"`` would never match a
+    compatible set containing ``"Db"`` even though they are the same pitch.
+
+    This converts sharp spellings to their flat equivalents so comparisons
+    against Camelot-derived keys succeed.  Unknown keys are returned as-is.
+    """
+    if not key:
+        return key
+    return _SHARP_TO_FLAT.get(key, key)
+
 
 def get_compatible_keys(key: str) -> list[str]:
     """Get harmonically compatible keys using Camelot Wheel.
