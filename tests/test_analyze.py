@@ -84,32 +84,32 @@ def test_pitch_class_names():
 # Spectral centroid
 # ---------------------------------------------------------------------------
 
+def _sine_wave(freq, sr, n):
+    """Generate n samples of a pure sine tone (pure Python, no numpy)."""
+    return [math.sin(2 * math.pi * freq * t / sr) for t in range(n)]
+
+
 def test_spectral_centroid_pure_tone_matches_frequency():
     """純粋な正弦波のスペクトル重心はその周波数に近い値になる。
 
     README は "spectral analysis" / "spectral fingerprint" を謳うが、
     analyze_file() にスペクトル重心計算が未実装で、DB列は常に空だった。
-    compute_spectral_centroid は librosa に依存しない純粋関数として切り出し、
-    analyze_file から呼ぶ。
+    compute_spectral_centroid は numpy が無くても動く純粋関数として切り出し、
+    analyze_file から呼ぶ。CI は [dev] しか入れない（numpy/librosa 不要）。
     """
-    import numpy as np
-
     sr = 22050
-    freq = 440.0  # A4
-    dur = 1.0
-    t = np.linspace(0, dur, int(sr * dur), endpoint=False)
-    y = np.sin(2 * math.pi * freq * t).astype(np.float32)
+    freq = 440.0  # A4 — bins at sr/2048 ≈ 10.77Hz spacing, so 440 lands near bin 41
+    n = 2048  # one analysis frame; keeps the pure-Python DFT fallback fast
+    y = _sine_wave(freq, sr, n)
 
     centroid = compute_spectral_centroid(y, sr)
-    # 正弦波の重心は周波数本身。FFT分解能と窓の影響で多少の誤差は出るので ±25Hz。
-    assert abs(centroid - freq) < 25.0, f"純音 {freq}Hz の重心 {centroid:.1f} がずれすぎ"
+    # 正弦波の重心は周波数本身。ビン分解能と窓の影響で多少の誤差は出るので ±30Hz。
+    assert abs(centroid - freq) < 30.0, f"純音 {freq}Hz の重心 {centroid:.1f} がずれすぎ"
 
 
 def test_spectral_centroid_silence_is_zero():
     """無音のスペクトル重心は 0（ゼロ除算を起こさない）。"""
-    import numpy as np
-
-    y = np.zeros(22050, dtype=np.float32)
+    y = [0.0] * 2048
     assert compute_spectral_centroid(y, 22050) == 0.0
 
 
@@ -119,12 +119,10 @@ def test_spectral_centroid_higher_for_high_frequency():
     重複検出 find_similar_by_spectral はこの値の近さでグループ化するため、
     音色の明るさを反映できることが重要。
     """
-    import numpy as np
-
     sr = 22050
-    t = np.linspace(0, 1.0, sr, endpoint=False)
-    low = np.sin(2 * math.pi * 110.0 * t).astype(np.float32)   # A2
-    high = np.sin(2 * math.pi * 2000.0 * t).astype(np.float32)  # ~B6
+    n = 2048
+    low = _sine_wave(110.0, sr, n)    # A2
+    high = _sine_wave(2000.0, sr, n)  # ~B6
 
     low_c = compute_spectral_centroid(low, sr)
     high_c = compute_spectral_centroid(high, sr)
