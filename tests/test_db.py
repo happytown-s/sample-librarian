@@ -695,3 +695,82 @@ def test_recommend_samples_db_sharp_key_normalization(db_conn, sample_factory):
         "シャープ表記 C# は Db と異名同音。Db の互換セットに Db が含まれるため"
         "推薦されるべきだが、正規化なしでは見逃される（バグ C1）"
     )
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point (_main): --duplicates / --migrate flags
+# ---------------------------------------------------------------------------
+
+def test_main_duplicates_flag_prints_report(tmp_path, capsys):
+    """`--duplicates` は find_all_duplicates の結果をJSONでstdoutに出す。
+
+    README の CLI Usage に `python3 -m librarian.db --duplicates` と書かれているが、
+    実装にはフラグが存在しなかった（バグ）。重複検出関数自体は存在するので、
+    CLI から呼べるようにする。
+    """
+    from librarian.db import _main, upsert_analysis
+
+    db_path = str(tmp_path / "dup.db")
+    init_db(db_path)
+    conn = get_db(db_path)
+    try:
+        # 同じ file_hash を持つ2サンプル → by_hash で1グループ検出される
+        for name in ("kick_a.wav", "kick_b.wav"):
+            sid = upsert_sample(conn, {
+                "path": f"/lib/{name}", "name": name, "ext": "wav",
+                "size": 100, "category": "Kick", "folder": "Kicks",
+                "root": "/lib", "file_hash": "HASH_SAME",
+                "strings": [], "tags": [],
+            })
+            upsert_analysis(conn, sid, {
+                "key": "F", "pitch": "F", "note_number": 41,
+                "duration": 0.5, "sample_type": "oneshot",
+            })
+    finally:
+        conn.close()
+
+    rc = _main(["--db", db_path, "--duplicates", "--json"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    report = json.loads(captured.out)
+    # find_all_duplicates は by_hash/by_duration/by_pitch/by_spectral を返す
+    assert "by_hash" in report
+    assert "by_duration" in report
+    assert "by_pitch" in report
+    assert "by_spectral" in report
+    assert len(report["by_hash"]) == 1, "同じ hash の2サンプルで1グループ"
+
+
+def test_main_migrate_flag_loads_jsonl(tmp_path, capsys):
+    """`--migrate <path>` は JSONL を SQLite へ取り込む。
+
+    README に `python3 -m librarian.db --migrate data/samples_index.jsonl` とあるが、
+    実装にはフラグが存在しなかった（バグ）。--jsonl と同等の機能を提供する。
+    """
+    from librarian.db import _main
+
+    db_path = str(tmp_path / "mig.db")
+    jsonl_path = tmp_path / "samples_index.jsonl"
+    # 最小のJSONLレコードを1件書く
+    jsonl_path.write_text(json.dumps({
+        "path": "/lib/kick.wav",
+        "name": "kick.wav",
+        "ext": "wav",
+        "size": 100,
+        "category": "Kick",
+        "folder": "Kicks",
+        "root": "/lib",
+    }) + "\n", encoding="utf-8")
+
+    rc = _main(["--db", db_path, "--migrate", str(jsonl_path), "--stats"])
+    capsys.readouterr()  # consume output so it doesn't leak
+
+    assert rc == 0
+
+    conn = get_db(db_path)
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 1, "JSONLの1レコードが取り込まれるべき"

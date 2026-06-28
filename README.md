@@ -299,7 +299,7 @@ python3 -m librarian.db --stats
 .venv/bin/python3 -m pytest tests/ -v
 ```
 
-22 tests covering database operations, search, analysis, and enrichment.
+39 tests covering database operations, search, analysis, and enrichment.
 CI runs on GitHub Actions with ruff lint + pytest.
 
 ## Requirements

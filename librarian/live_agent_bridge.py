@@ -289,17 +289,38 @@ def preview_sample(
             state = _send("get_live_state", host=host, port=port)
             track_index = len(state.get("tracks", [])) - 1
 
+    # Guard: a usable track index is required to place a clip. This can fail
+    # when the Live set has no tracks and create_audio_track didn't add one
+    # (e.g. LiveAgent misbehaving). Previously this fell through and crashed
+    # with IndexError on an empty tracks list.
+    if track_index < 0:
+        return {
+            "error": (
+                "No audio track available in Live. Create an audio track "
+                "(or a Drum Rack) before previewing."
+            ),
+            "file_path": file_path,
+        }
+
     if slot_index < 0:
         # Find next empty slot
         state = _send("get_live_state", host=host, port=port)
         tracks = state.get("tracks", [])
-        if track_index < len(tracks):
+        if 0 <= track_index < len(tracks):
             clips = tracks[track_index].get("clip_slots", [])
             slot_index = len(clips)
             for i, c in enumerate(clips):
                 if not c.get("has_clip"):
                     slot_index = i
                     break
+        else:
+            return {
+                "error": (
+                    f"track_index {track_index} is out of range for the "
+                    f"{len(tracks)} track(s) in the current Live set."
+                ),
+                "file_path": file_path,
+            }
 
     return _send(
         "import_audio_clip",
@@ -482,13 +503,17 @@ def build_drum_rack_for_key(
     conn = get_db(db_path)
 
     searches = {}
-    for cat, search_terms in [
-        ("Kick", f"kick {target_key.rstrip('m')}"),
-        ("Snare", "snare"),
-        ("HiHat", "hihat closed"),
+    # (internal_key, db_category, search_terms).
+    # db_category must match the spelling stored by batch_analyze_sqlite.
+    # derive_category() normalises both "hat" and "hihat" to "Hat", so the DB
+    # column is "Hat" — using "HiHat" here silently returned zero candidates.
+    for cat, db_category, search_terms in [
+        ("Kick", "Kick", f"kick {target_key.rstrip('m')}"),
+        ("Snare", "Snare", "snare"),
+        ("HiHat", "Hat", "hihat closed"),
     ]:
         hits = search_samples_enriched(
-            conn, search_terms, category=cat, limit=limit_per_category,
+            conn, search_terms, category=db_category, limit=limit_per_category,
         )
         searches[cat] = hits
 

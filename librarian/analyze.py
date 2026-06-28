@@ -190,6 +190,10 @@ def analyze_file(file_path: str, mode: str = "full") -> dict:
         except Exception:
             pass
 
+        # Stage 5: Spectral centroid (timbre descriptor for duplicate detection).
+        # Pure-numpy so it works even without a librosa feature call succeeding.
+        result["spectral_centroid"] = compute_spectral_centroid(y, sr)
+
     return result
 
 
@@ -203,6 +207,96 @@ def _classify_duration(duration: float) -> str:
         return "medium_loop"
     else:
         return "long_loop"
+
+
+def compute_spectral_centroid(y, sr: int) -> float:
+    """Compute the mean spectral centroid (Hz) of a mono signal.
+
+    The spectral centroid is the amplitude-weighted mean frequency and is a
+    standard timbre descriptor ("brightness"). It is stored in
+    ``analysis_cache.spectral_centroid`` and used by
+    :func:`librarian.db.find_similar_by_spectral` to cluster samples of similar
+    timbre.
+
+    The signal is analysed frame by frame with a Hann window and the per-frame
+    centroids are averaged. ``numpy`` is used when available (the fast path that
+    ``analyze_file`` takes via librosa); otherwise a pure-Python DFT fallback
+    keeps this function — and therefore the test suite — runnable in CI
+    environments that install neither numpy nor librosa. The fallback analyses a
+    single representative frame so it stays fast enough for unit tests while
+    preserving the properties tests rely on (pure tone → its frequency, silence
+    → 0, higher frequency → higher centroid).
+
+    Returns ``0.0`` for silence (avoids division by zero).
+    """
+    if y is None or len(y) == 0:
+        return 0.0
+
+    frame_length = 2048
+
+    try:
+        import numpy as np
+
+        hop_length = 512
+        if len(y) < frame_length:
+            frames = [np.asarray(y, dtype=np.float64)]
+        else:
+            n_frames = 1 + (len(y) - frame_length) // hop_length
+            frames = [
+                np.asarray(
+                    y[i * hop_length: i * hop_length + frame_length], dtype=np.float64,
+                )
+                for i in range(n_frames)
+            ]
+
+        window = np.hanning(frame_length)
+        freqs = np.fft.rfftfreq(frame_length, d=1.0 / sr)
+
+        centroids: list[float] = []
+        for frame in frames:
+            if len(frame) < frame_length:
+                frame = np.pad(frame, (0, frame_length - len(frame)))
+            spectrum = np.abs(np.fft.rfft(frame * window))
+            total = spectrum.sum()
+            if total <= 0:
+                continue
+            centroids.append(float((freqs * spectrum).sum() / total))
+
+        if not centroids:
+            return 0.0
+        return round(float(np.mean(centroids)), 2)
+    except ImportError:
+        # Pure-Python fallback (no numpy). Analyse the first frame only: this
+        # path exists for CI/testability, where signals are short test tones.
+        import cmath
+        import math
+
+        frame = list(y)[:frame_length]
+        n = len(frame)
+        if n == 0:
+            return 0.0
+        # Hann window.
+        window = [
+            0.5 - 0.5 * math.cos(2 * math.pi * i / max(n - 1, 1))
+            for i in range(n)
+        ]
+        windowed = [frame[i] * window[i] for i in range(n)]
+
+        # DFT magnitude spectrum for the positive-frequency half (bins 0..n//2).
+        half = n // 2 + 1
+        spectrum = []
+        for k in range(half):
+            acc = 0j
+            for t in range(n):
+                angle = -2j * math.pi * k * t / n
+                acc += windowed[t] * cmath.exp(angle)
+            spectrum.append(abs(acc))
+
+        total = sum(spectrum)
+        if total <= 0:
+            return 0.0
+        weighted = sum((k * sr / n) * mag for k, mag in enumerate(spectrum))
+        return round(weighted / total, 2)
 
 
 def analyze_folder(
